@@ -1,8 +1,6 @@
-# The LOLIN S2 mini has no UART0 pins on its headers, so the console must go
-# over the native USB port as CDC. Harmless on the S3 DevKitC (which also has a
-# separate UART bridge); override with menuconfig if you prefer UART0 there.
-CONFIG_ESP_CONSOLE_USB_CDC=y
-CONFIG_ESP_CONSOLE_USB_CDC_SUPPORT_ETS_PRINTF=y
+# Settings shared by every target. Chip-specific settings (console, pins,
+# buffer sizes, core affinity) are in sdkconfig.defaults.<target>, which
+# ESP-IDF applies on top of this file automatically.
 
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE_DETECT=y
@@ -23,9 +21,21 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
+# UART interrupt stays serviceable while flash is busy (NVS writes from the
+# app), so the 128-byte RX FIFO cannot overflow during a settings save.
+CONFIG_UART_ISR_IN_IRAM=y
 
-CONFIG_BRIDGE_UART_TX_GPIO=35
-CONFIG_BRIDGE_UART_RX_GPIO=33
+# Web app + command API: WebSocket terminal, room for the extra sockets
+# (UART/SWD/bitbang listeners + clients, httpd, discovery, mDNS), browser
+# request headers, and a 1.5 MB app partition (NVS offset is unchanged, so
+# saved settings survive the partition table change).
+CONFIG_HTTPD_WS_SUPPORT=y
+CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT=y
+CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
 CONFIG_BRIDGE_UART_BAUD=115200
 CONFIG_BRIDGE_TCP_PORT=2324
 CONFIG_BRIDGE_SWD_CLOCK_KHZ=1000

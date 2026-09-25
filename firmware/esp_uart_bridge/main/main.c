@@ -1,14 +1,16 @@
-/* Dreame robot debug bridge - phase P0.
+/* Dreame robot debug bridge (ESP32-S2 / ESP32-S3).
  *
- * Exposes the selected robot UART on TCP. In the temporary S2 mini profile the
- * primary UART is the MCU parameter UART on GPIO35/GPIO33; GPIO16/GPIO18 are
- * reserved for the future SWD path. Nothing else: no USB host, no ADB, no
- * authentication. See prototype/s2_mini/WIRING.md before connecting this to a
- * robot, and hardware/rev_a/DESIGN_REVIEW.md for the current limitations.
+ * Wi-Fi <-> robot UART and SWD:
+ *   http://<bridge>/     web app (Wi-Fi setup, terminal, commands, SWD)
+ *   POST /api/cmd        command API shared with the PC tool and AI agents
+ *   tcp/2324             raw UART (RobotMonitor)
+ *   tcp/2325, tcp/3335   SWD text API, OpenOCD remote_bitbang
+ *   udp/2326             LAN discovery
+ * Wi-Fi is configured at runtime through the setup AP (DreameBridge-XXXX) or
+ * "wifi.set"; see README.md.
  *
- * SECURITY: the bridge requires a WPA2-protected Wi-Fi network, but the raw
- * TCP console itself has no second application password. Keep it unpowered
- * when not in use, or put it on an isolated VLAN.
+ * SECURITY: nothing on the LAN side is authenticated beyond the Wi-Fi itself.
+ * Keep it on a trusted network or an isolated VLAN.
  */
 
 #include "freertos/FreeRTOS.h"
@@ -21,11 +23,21 @@
 #if CONFIG_BRIDGE_MDNS_ENABLE
 #include "mdns.h"
 #endif
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
+#elif CONFIG_ESP_CONSOLE_UART
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
+#endif
 
-#include "uart_tcp_bridge.h"
-#include "swd_bridge.h"
+#include "cmd.h"
 #include "discovery.h"
-#include "wifi_sta.h"
+#include "settings.h"
+#include "swd_bridge.h"
+#include "uart_tcp_bridge.h"
+#include "web.h"
+#include "wifi_mgr.h"
 
 static const char *TAG = "main";
 
@@ -48,6 +60,23 @@ static const char *TAG = "main";
 #endif
 #endif
 
+/* The USB console also carries "@CMD"/"@SWD" requests. USB-Serial-JTAG (S3)
+ * and UART consoles need their driver for blocking line reads from stdin; the
+ * S2 ROM CDC console works without one. */
+static void console_input_init(void)
+{
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    if (usb_serial_jtag_driver_install(&cfg) == ESP_OK) {
+        usb_serial_jtag_vfs_use_driver();
+    }
+#elif CONFIG_ESP_CONSOLE_UART && !CONFIG_BRIDGE_MCU_UART_ENABLE
+    if (uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 512, 0, 0, NULL, 0) == ESP_OK) {
+        uart_vfs_dev_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
+    }
+#endif
+}
+
 #if CONFIG_BRIDGE_MDNS_ENABLE
 /* <hostname>.local survives DHCP handing out a new address. Not fatal: the
  * UDP discovery responder still works without it. */
@@ -60,6 +89,7 @@ static void mdns_start(void)
     }
     mdns_hostname_set(CONFIG_BRIDGE_HOSTNAME);
     mdns_instance_name_set("Dreame UART/SWD bridge");
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
     mdns_service_add(NULL, "_dreame-bridge", "_tcp", CONFIG_BRIDGE_TCP_PORT, NULL, 0);
 #if CONFIG_BRIDGE_SWD_ENABLE
     mdns_service_add(NULL, "_dreame-swd", "_tcp", CONFIG_BRIDGE_SWD_TCP_PORT, NULL, 0);
@@ -72,6 +102,7 @@ static void mdns_start(void)
 
 /* Status at a glance, since the board lives under a robot's top cover:
  *   fast blink (100 ms)  - joining Wi-Fi, or the link dropped
+ *   double blink         - setup AP is up (connect to DreameBridge-XXXX)
  *   slow blink (1000 ms) - on the network, idle, waiting for a client
  *   solid on             - a client holds the console
  */
@@ -97,9 +128,20 @@ static void led_task(void *arg)
             continue;
         }
 
+        if (wifi_mgr_ap_active()) {
+            for (int i = 0; i < 2; i++) {
+                gpio_set_level(CONFIG_BRIDGE_LED_GPIO, 1);
+                vTaskDelay(pdMS_TO_TICKS(80));
+                gpio_set_level(CONFIG_BRIDGE_LED_GPIO, 0);
+                vTaskDelay(pdMS_TO_TICKS(120));
+            }
+            vTaskDelay(pdMS_TO_TICKS(600));
+            continue;
+        }
+
         on = !on;
         gpio_set_level(CONFIG_BRIDGE_LED_GPIO, on);
-        vTaskDelay(pdMS_TO_TICKS(wifi_sta_is_up() ? 1000 : 100));
+        vTaskDelay(pdMS_TO_TICKS(wifi_mgr_sta_up() ? 1000 : 100));
     }
 }
 #endif /* CONFIG_BRIDGE_LED_GPIO >= 0 */
@@ -113,22 +155,30 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    settings_load();
+    console_input_init();
+
+    /* Wi-Fi does not block: the services listen on every interface, so they
+     * work through the setup AP as well as the home network. */
+    ESP_ERROR_CHECK(wifi_mgr_start());
+
 #if CONFIG_BRIDGE_LED_GPIO >= 0
     xTaskCreate(led_task, "led", 2048, NULL, 2, NULL);
 #endif
-
-    ESP_ERROR_CHECK(wifi_sta_start_and_wait());
 #if CONFIG_BRIDGE_MDNS_ENABLE
     mdns_start();
 #endif
     uart_tcp_bridge_start();
+    cmd_start();
 #if CONFIG_BRIDGE_SWD_ENABLE
     swd_bridge_start();
 #endif
 #if CONFIG_BRIDGE_DISCOVERY_ENABLE
     discovery_start();
 #endif
+    web_start();
 
-    ESP_LOGI(TAG, "ready:  nc %s %d", wifi_sta_ip(), CONFIG_BRIDGE_TCP_PORT);
-    ESP_LOGW(TAG, "raw TCP console has no application password or encryption");
+    ESP_LOGI(TAG, "ready: app http://%s.local/, raw UART tcp/%d, SWD tcp/%d",
+             CONFIG_BRIDGE_HOSTNAME, CONFIG_BRIDGE_TCP_PORT, CONFIG_BRIDGE_SWD_TCP_PORT);
+    ESP_LOGW(TAG, "LAN services have no application password; use a trusted network");
 }

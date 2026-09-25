@@ -40,6 +40,8 @@
 
 #include "lwip/sockets.h"
 
+#include "bridge_cores.h"
+#include "settings.h"
 #include "uart_tcp_bridge.h"
 
 static const char *TAG = "bridge";
@@ -66,6 +68,11 @@ static const char *TAG = "bridge";
 #define UART_EVT_QUEUE_LEN  32
 /* Safety net only: a dropped UART_DATA event must not strand bytes in the ring. */
 #define RX_EVT_TIMEOUT_MS   20
+/* Idle time (in character times) after which the UART hands a partial FIFO to
+ * the driver. The driver default is 10; 4 cuts ~0.5 ms off every reply at
+ * 115200 while still batching back-to-back bytes. */
+#define RX_TIMEOUT_SYMBOLS  4
+#define MAX_TAPS            2
 
 /* A client that vanished without FIN (Wi-Fi drop, laptop sleep) is detected
  * after IDLE + INTVL * CNT = 11 s instead of lwIP's default two hours. */
@@ -112,6 +119,8 @@ typedef struct {
     size_t backlog_len;
 #endif
 } channel_t;
+
+static uart_tcp_bridge_tap_t s_taps[MAX_TAPS];
 
 static volatile bool s_soc_client;
 #if CONFIG_BRIDGE_MCU_UART_ENABLE
@@ -189,9 +198,7 @@ static void uart_init_channel(channel_t *ch)
     ESP_ERROR_CHECK(uart_param_config(ch->uart, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(ch->uart, ch->tx_gpio, ch->rx_gpio,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-
-    /* Default RX timeout is ~10 symbols idle; keep it (0.4 ms at 230400) so a
-     * short reply is delivered as soon as the line goes quiet. */
+    ESP_ERROR_CHECK(uart_set_rx_timeout(ch->uart, RX_TIMEOUT_SYMBOLS));
 
     if (ch->sw_flowctrl) {
         ESP_ERROR_CHECK(uart_set_sw_flow_ctrl(ch->uart, true,
@@ -302,6 +309,13 @@ static void drain_uart(channel_t *ch)
         }
         ch->rx_bytes += (uint32_t)n;
         forward_to_client(ch, ch->rx_chunk, (size_t)n);
+        if (ch == &s_channel_primary) {
+            for (int i = 0; i < MAX_TAPS; i++) {
+                if (s_taps[i] != NULL) {
+                    s_taps[i](ch->rx_chunk, (size_t)n);
+                }
+            }
+        }
     }
 }
 
@@ -380,7 +394,7 @@ static void detach_client(channel_t *ch, int sock)
  *
  * This runs before the monitor and TCP tasks exist, so nothing else is draining
  * the driver ring while we count. */
-static const int PROBE_BAUDS[] = { 230400, 115200, 57600, 9600 };
+static const int PROBE_BAUDS[] = { 115200, 57600, 9600 };
 
 /* The X40 debug header carries more than the MCU UART, and the project's own
  * wiring note warns that its pin order differs from the older machines the
@@ -630,7 +644,7 @@ static void tcp_task(void *arg)
                                      (size_t)n) < 0) {
                     ESP_LOGW(TAG, "%s: uart write failed", ch->name);
                 } else {
-                    ch->tx_bytes += (uint32_t)n;
+                    __atomic_fetch_add(&ch->tx_bytes, (uint32_t)n, __ATOMIC_RELAXED);
                 }
             } else if (n == 0 || (errno != EINTR && errno != EAGAIN)) {
                 if (n == 0) {
@@ -707,16 +721,50 @@ int uart_tcp_bridge_baud(void)
     return s_channel_primary.baud;
 }
 
+esp_err_t uart_tcp_bridge_set_baud(int baud)
+{
+    if (baud < 1200 || baud > 5000000) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = uart_set_baudrate(s_channel_primary.uart, (uint32_t)baud);
+    if (err == ESP_OK) {
+        s_channel_primary.baud = baud;
+        ESP_LOGI(TAG, "primary: baud -> %d", baud);
+    }
+    return err;
+}
+
+int uart_tcp_bridge_write(const uint8_t *data, size_t len)
+{
+    int n = uart_write_bytes(s_channel_primary.uart, (const char *)data, len);
+    if (n > 0) {
+        __atomic_fetch_add(&s_channel_primary.tx_bytes, (uint32_t)n, __ATOMIC_RELAXED);
+    }
+    return n;
+}
+
+void uart_tcp_bridge_add_tap(uart_tcp_bridge_tap_t tap)
+{
+    for (int i = 0; i < MAX_TAPS; i++) {
+        if (s_taps[i] == NULL || s_taps[i] == tap) {
+            s_taps[i] = tap;
+            return;
+        }
+    }
+    ESP_LOGE(TAG, "no free tap slot");
+}
+
 static void start_channel(channel_t *ch, const char *rx_name, const char *tcp_name)
 {
     /* The UART reader runs above the TCP side so a burst from the robot is
      * moved out of the 128-byte FIFO/ring before anything else. */
-    xTaskCreate(uart_rx_task, rx_name, 3072, ch, 6, NULL);
-    xTaskCreate(tcp_task, tcp_name, 4096, ch, 5, NULL);
+    xTaskCreatePinnedToCore(uart_rx_task, rx_name, 3072, ch, 6, NULL, BRIDGE_IO_CORE);
+    xTaskCreatePinnedToCore(tcp_task, tcp_name, 4096, ch, 5, NULL, BRIDGE_IO_CORE);
 }
 
 void uart_tcp_bridge_start(void)
 {
+    s_channel_primary.baud = settings_uart_baud();
     uart_init_channel(&s_channel_primary);
 #if CONFIG_BRIDGE_UART_AUTOBAUD
     autobaud_probe(&s_channel_primary);

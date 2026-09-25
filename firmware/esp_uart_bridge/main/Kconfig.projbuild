@@ -1,34 +1,41 @@
 menu "Dreame bridge configuration"
 
 config BRIDGE_WIFI_SSID
-    string "Wi-Fi SSID"
+    string "Default Wi-Fi SSID (used until one is set from the app)"
     default "changeme"
     help
-        SSID of the network the bridge joins. The bridge is a station only;
-        it never opens an access point.
+        Build-time fallback only. The network is normally set at runtime with
+        the app / "wifi.set" command and stored in NVS, which takes priority.
+        Leave "changeme" to boot straight into the setup access point.
 
 config BRIDGE_WIFI_PASSWORD
-    string "Wi-Fi password"
+    string "Default Wi-Fi password"
     default "changeme"
     help
-        WPA2 passphrase. Leave empty for an open network.
+        WPA2/WPA3 passphrase for BRIDGE_WIFI_SSID (8..63 characters).
+        Open networks are refused.
 
-config BRIDGE_WIFI_SSID_FALLBACK
-    string "Fallback Wi-Fi SSID (optional)"
-    default ""
+config BRIDGE_SETUP_AP_PASSWORD
+    string "Setup access point password"
+    default "dreame-setup"
     help
-        Secondary SSID tried with the same password after the primary one has
-        failed CONFIG_BRIDGE_WIFI_MAX_RETRY times. The board usually sits
-        inside a robot where the SSID cannot be corrected by hand, so a typo or
-        an AP that only covers part of the site must not strand the bridge.
-        Leave empty to disable.
+        WPA2 passphrase of the "DreameBridge-XXXX" setup AP (8..63 chars).
+        Anyone who knows it can reach the robot's UART/SWD while the setup
+        AP is up, so change it for your build.
 
-config BRIDGE_WIFI_MAX_RETRY
-    int "Reconnect attempts before backing off"
-    default 8
+config BRIDGE_SETUP_AP_DELAY_S
+    int "Seconds without a network before the setup AP comes up"
+    default 30
+    range 5 3600
     help
-        After this many consecutive failures the bridge waits 30 s before
-        trying again, so a wrong password does not hammer the AP forever.
+        The setup AP also comes up immediately when no network is configured,
+        and on request (app, "wifi.ap on", setup button).
+
+config BRIDGE_SETUP_BUTTON_GPIO
+    int "Setup button GPIO (hold 3 s for the setup AP), -1 to disable"
+    default 0
+    help
+        GPIO0 is the BOOT button on the LOLIN S2 mini.
 
 config BRIDGE_HOSTNAME
     string "DHCP hostname"
@@ -70,14 +77,17 @@ config BRIDGE_UART_RX_GPIO
         1 kohm in series after verifying the robot pin.
 
 config BRIDGE_UART_BAUD
-    int "UART baud rate"
-    default 230400
+    int "Default UART baud rate"
+    default 115200
+    help
+        Used until a rate is set at runtime ("uart.baud <rate>"), which is
+        saved in NVS and takes priority.
 
 config BRIDGE_UART_AUTOBAUD
     bool "Probe several baud rates on the primary UART at boot"
     default n
     help
-        Runs 230400/115200/57600/9600 in turn, sends a line feed and "info -a"
+        Runs 115200/57600/9600 in turn, sends a line feed and "info -a"
         at each, and locks onto the first rate that produces bytes. Adds about
         six seconds to boot.
 
@@ -89,9 +99,8 @@ config BRIDGE_UART_EVEN_PARITY
     bool "Primary UART even parity"
     default n
     help
-        Older X40/MR813 reference firmware was analyzed as 230400 8N1. The
-        live MCU image and the physical UART endpoint must be verified before
-        treating that setting as the command-channel format.
+        The MCU application UART is 8N1; only enable this for a peer that
+        is known to use even parity.
 
 config BRIDGE_UART_RX_BUF
     int "UART driver RX ring buffer (bytes)"
@@ -143,7 +152,7 @@ config BRIDGE_MCU_UART_RX_GPIO
 
 config BRIDGE_MCU_UART_BAUD
     int "MCU UART baud rate"
-    default 230400
+    default 115200
     help
         This is a configured rate only. Verify the current MCU image and
         physical command UART before treating it as the MCU CLI baud.

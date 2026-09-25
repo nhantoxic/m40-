@@ -1,7 +1,10 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,9 +40,20 @@ typedef struct {
  * not built into this firmware zeroes the output. */
 void uart_tcp_bridge_get_stats(int index, uart_tcp_bridge_stats_t *out);
 
-/* Baud rate the primary channel is actually running at. This differs from
- * CONFIG_BRIDGE_UART_BAUD when the boot-time autobaud probe found a peer. */
+/* Baud rate the primary channel is running at (saved setting, else
+ * CONFIG_BRIDGE_UART_BAUD). */
 int uart_tcp_bridge_baud(void);
+
+/* Changes the primary channel baud immediately (not persisted here). */
+esp_err_t uart_tcp_bridge_set_baud(int baud);
+
+/* Writes to the primary UART from the app/command path. Returns bytes queued. */
+int uart_tcp_bridge_write(const uint8_t *data, size_t len);
+
+/* Called from the UART reader task with every chunk received on the primary
+ * channel, whether or not a TCP client is connected. Keep it short. */
+typedef void (*uart_tcp_bridge_tap_t)(const uint8_t *data, size_t len);
+void uart_tcp_bridge_add_tap(uart_tcp_bridge_tap_t tap);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f172a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Dreame Bridge</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--bg:#f3f4f6;--card:#fff;--fg:#111827;--mut:#6b7280;--bd:#e5e7eb;--acc:#2563eb;--ok:#16a34a;--bad:#dc2626;--warn:#d97706;--term:#0b1220;--tfg:#e5e7eb}
+@media(prefers-color-scheme:dark){:root{--bg:#0b0f17;--card:#111827;--fg:#e5e7eb;--mut:#9ca3af;--bd:#1f2937;--term:#05080e}}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--bd);padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+header b{font-size:16px}.pill{font-size:12px;padding:2px 9px;border-radius:99px;border:1px solid var(--bd);color:var(--mut);white-space:nowrap}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--bad);margin-right:5px}.on .dot{background:var(--ok)}
+nav{display:flex;gap:4px;padding:8px 14px 0;overflow-x:auto;max-width:1100px;margin:0 auto}nav button{border:0;background:none;padding:8px 12px;border-radius:8px 8px 0 0;color:var(--mut);font-weight:600}
+nav button.act{background:var(--card);color:var(--fg)}
+main{padding:0 14px 20px;max-width:1100px;margin:0 auto}section{display:none}section.act{display:block}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-top:12px}
+.card h3{margin:0 0 10px;font-size:15px}
+input,select,button,textarea{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:9px 11px}
+button{cursor:pointer;background:var(--card)}button:hover{border-color:var(--acc)}button:disabled{opacity:.5}
+button.pri{background:var(--acc);border-color:var(--acc);color:#fff}button.danger{color:var(--bad)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}.row>input[type=text],.row>input[type=password],.grow{flex:1;min-width:0}
+label{color:var(--mut);font-size:13px;display:flex;gap:4px;align-items:center}
+.muted{color:var(--mut);font-size:13px}.okc{color:var(--ok)}.badc{color:var(--bad)}.warnc{color:var(--warn)}
+.nets{list-style:none;margin:8px 0 0;padding:0;max-height:280px;overflow:auto}
+.nets li{display:flex;justify-content:space-between;gap:8px;padding:9px 6px;border-bottom:1px solid var(--bd);cursor:pointer}.nets li:hover{background:var(--bg)}
+.nets li.no{opacity:.5;cursor:not-allowed}
+#log{background:var(--term);color:var(--tfg);font:13px/1.35 ui-monospace,Menlo,Consolas,monospace;height:52vh;min-height:220px;overflow:auto;padding:8px;border-radius:8px;white-space:pre-wrap;word-break:break-all}
+#log .tx{color:#93c5fd}#log .sys{color:#fbbf24}#log .ts{color:#64748b}
+pre.out{background:var(--term);color:var(--tfg);padding:10px;border-radius:8px;overflow:auto;max-height:50vh;font:12.5px ui-monospace,Menlo,Consolas,monospace;margin:8px 0 0;white-space:pre-wrap;word-break:break-all}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:6px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:13px}.kv span:nth-child(odd){color:var(--mut)}
+table.cmds{width:100%;border-collapse:collapse;font-size:13px}table.cmds td{border-top:1px solid var(--bd);padding:6px 4px;vertical-align:top}table.cmds code{cursor:pointer;color:var(--acc)}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--mut);border-top-color:transparent;border-radius:50%;animation:s 1s linear infinite;vertical-align:-2px}@keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<header>
+  <b>Dreame Bridge</b>
+  <span class="pill" id="wsPill"><span class="dot"></span><span id="wsTxt">offline</span></span>
+  <span class="pill" id="netPill">…</span>
+  <span class="pill" id="ratePill">–</span>
+</header>
+<nav id="tabs">
+  <button data-t="wifi">Wi-Fi</button><button data-t="term">Terminal</button><button data-t="cmd">Lệnh / API</button><button data-t="swd">SWD</button>
+</nav>
+<main>
+
+<section id="t-wifi">
+  <div class="card"><h3>Trạng thái</h3><div class="kv" id="wifiKv"></div></div>
+  <div class="card">
+    <h3>Kết nối Wi-Fi trong nhà</h3>
+    <div class="row"><button id="scanBtn">Quét mạng</button><span class="muted" id="scanMsg"></span></div>
+    <ul class="nets" id="nets"></ul>
+    <div class="row"><input type="text" id="ssid" placeholder="Tên Wi-Fi (SSID)" autocomplete="off"></div>
+    <div class="row"><input type="password" id="pass" placeholder="Mật khẩu (8–63 ký tự)"><label><input type="checkbox" id="showPass"> Hiện</label></div>
+    <div class="row"><button class="pri" id="saveWifi">Lưu &amp; kết nối</button></div>
+    <p class="muted" id="wifiMsg"></p>
+  </div>
+  <div class="card">
+    <h3>Khác</h3>
+    <div class="row"><button id="apOn">Bật AP cài đặt (10 phút)</button><button id="apOff">Tắt AP cài đặt</button><button class="danger" id="forget">Quên Wi-Fi</button><button class="danger" id="reboot">Khởi động lại</button></div>
+    <p class="muted">Khi mất Wi-Fi quá 30 s (hoặc giữ nút BOOT 3 s), bridge phát AP <b id="apName">DreameBridge-XXXX</b>. Kết nối điện thoại vào AP đó rồi mở <b>http://192.168.4.1</b>.</p>
+  </div>
+</section>
+
+<section id="t-term">
+  <div class="card">
+    <div id="log"></div>
+    <div class="row">
+      <input type="text" id="inp" class="grow" placeholder="Lệnh gửi xuống robot (↑/↓ lịch sử; \r \n \xHH)" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <select id="eol" title="Kết thúc dòng"><option value="">none</option><option value="\n">LF</option><option value="\r">CR</option><option value="\r\n" selected>CRLF</option></select>
+      <label><input type="checkbox" id="hexIn"> HEX</label>
+      <button class="pri" id="send">Gửi</button>
+    </div>
+    <div class="row">
+      <label>Hiển thị <select id="view"><option value="text">Text</option><option value="hex">Hex</option></select></label>
+      <label><input type="checkbox" id="ts"> Giờ</label><label><input type="checkbox" id="echo" checked> Hiện lệnh gửi</label><label><input type="checkbox" id="auto" checked> Tự cuộn</label>
+      <label>Baud <select id="baud"></select></label>
+      <button id="clr">Xoá</button><button id="saveLog">Lưu log</button>
+    </div>
+  </div>
+  <div class="card"><h3>Macro</h3><div class="grid" id="macros"></div>
+    <details><summary class="muted">Sửa macro (mỗi dòng: Tên = lệnh)</summary><textarea id="macroTxt" rows="6" style="width:100%;margin-top:8px"></textarea><div class="row"><button id="macroSave">Lưu macro</button></div></details>
+  </div>
+</section>
+
+<section id="t-cmd">
+  <div class="card">
+    <h3>Lệnh (giống hệt CLI trên PC và AI agent)</h3>
+    <div class="row"><input type="text" id="cline" class="grow" placeholder='vd: uart.xfer 800 "info -a\r\n"' autocomplete="off" autocapitalize="off" spellcheck="false"><button class="pri" id="crun">Chạy</button></div>
+    <pre class="out" id="cout">{}</pre>
+    <p class="muted">PC: <code>python bridge_tool.py &lt;lệnh&gt;</code> · HTTP: <code>POST /api/cmd</code> (header <code>X-Bridge: 1</code>, body = dòng lệnh) · USB: <code>@CMD &lt;lệnh&gt;</code></p>
+  </div>
+  <div class="card"><h3>Danh sách lệnh</h3><table class="cmds" id="cmdTable"></table></div>
+</section>
+
+<section id="t-swd">
+  <div class="card">
+    <h3>SWD</h3>
+    <div class="grid" id="swdBtns"></div>
+    <div class="row"><input type="text" id="rdAddr" value="0x08000000" style="width:130px"><input type="text" id="rdLen" value="256" style="width:80px"><button id="rdBtn">READ</button></div>
+    <div class="row"><input type="text" id="swdLine" class="grow" placeholder="Lệnh SWD tuỳ ý, vd: REGREAD 15"><button id="swdRun">Chạy</button></div>
+    <pre class="out" id="swdOut"></pre>
+  </div>
+</section>
+
+</main>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const store={get(k,d){try{const v=localStorage.getItem("rb."+k);return v==null?d:JSON.parse(v)}catch(e){return d}},set(k,v){try{localStorage.setItem("rb."+k,JSON.stringify(v))}catch(e){}}};
+const q=s=>'"'+String(s).replace(/\\/g,"\\\\").replace(/"/g,'\\"')+'"';
+const enc=new TextEncoder(),dec=new TextDecoder();
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function cmd(line,timeoutMs=35000){
+  const ctl=new AbortController(),t=setTimeout(()=>ctl.abort(),timeoutMs);
+  try{const r=await fetch("/api/cmd",{method:"POST",headers:{"X-Bridge":"1","Content-Type":"text/plain"},body:line,signal:ctl.signal});return await r.json()}
+  finally{clearTimeout(t)}
+}
+
+/* ---------- tabs ---------- */
+function tab(t){document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("act",b.dataset.t==t));document.querySelectorAll("section").forEach(s=>s.classList.toggle("act",s.id=="t-"+t));store.set("tab",t);if(t=="cmd"&&!$("cmdTable").rows.length)loadHelp()}
+document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>tab(b.dataset.t));
+
+/* ---------- status ---------- */
+let last=null,first=true;
+const fmtB=n=>n>=1e6?(n/1e6).toFixed(2)+" MB":n>=1e3?(n/1e3).toFixed(1)+" kB":n+" B";
+function kv(el,rows){el.innerHTML="";for(const[k,v]of rows){const a=document.createElement("span"),b=document.createElement("span");a.textContent=k;b.innerHTML=v;el.append(a,b)}}
+async function status(){
+  let s;try{s=await cmd("status",5000)}catch(e){$("netPill").textContent="mất kết nối";return}
+  if(!s.ok)return;const w=s.wifi,u=s.uart;
+  $("netPill").textContent=w.connected?`${w.ssid} · ${w.ip} · ${w.rssi} dBm`:(w.setup_ap?`AP cài đặt: ${w.setup_ap_ssid}`:"chưa có Wi-Fi");
+  $("apName").textContent=w.setup_ap_ssid;
+  const now=Date.now();if(last){const dt=(now-last.t)/1000;$("ratePill").textContent=`↓${fmtB(Math.max(0,Math.round((u.rx_bytes-last.rx)/dt)))}/s ↑${fmtB(Math.max(0,Math.round((u.tx_bytes-last.tx)/dt)))}/s`}
+  last={t:now,rx:u.rx_bytes,tx:u.tx_bytes};
+  kv($("wifiKv"),[
+    ["Wi-Fi",w.connected?`<b class="okc">đã kết nối</b> ${esc(w.ssid)}`:(w.ssid?`<b class="badc">chưa kết nối</b> ${esc(w.ssid)} ${w.last_error?"— "+esc(w.last_error):""}`:`<b class="warnc">chưa cài đặt</b>`)],
+    ["IP",w.connected?`${w.ip} · <a href="http://${esc(w.hostname)}/">${esc(w.hostname)}</a>`:"–"],
+    ["Tín hiệu",w.connected?w.rssi+" dBm":"–"],
+    ["AP cài đặt",w.setup_ap?`<b>bật</b> ${esc(w.setup_ap_ssid)} (${w.setup_ap_clients} thiết bị) · 192.168.4.1`:"tắt"],
+    ["UART",`${u.baud} ${u.mode} · TCP ${u.tcp_port}${u.tcp_client?" (đang có client)":""}`],
+    ["Bộ đếm",`nhận ${fmtB(u.rx_bytes)} · gửi ${fmtB(u.tx_bytes)} · lỗi frame ${u.frame_err} · parity ${u.parity_err} · tràn ${u.fifo_ovf+u.buf_full}`],
+    ["Firmware",`${esc(s.fw)} · uptime ${Math.floor(s.uptime_s/60)} phút · heap ${fmtB(s.free_heap)}`]]);
+  if(first){first=false;setBaud(u.baud);if(!w.connected)tab("wifi")}
+}
+setInterval(()=>{if(!document.hidden)status()},3000);
+
+/* ---------- wifi ---------- */
+const bars=r=>r>-55?"▂▄▆█":r>-67?"▂▄▆":r>-78?"▂▄":"▂";
+$("scanBtn").onclick=async()=>{
+  $("scanBtn").disabled=true;$("scanMsg").innerHTML='<span class="spin"></span> đang quét…';
+  try{const r=await cmd("wifi.scan",15000);$("nets").innerHTML="";
+    if(!r.ok){$("scanMsg").textContent="Lỗi: "+r.error;return}
+    $("scanMsg").textContent=r.networks.length+" mạng";
+    for(const n of r.networks){const li=document.createElement("li");if(!n.supported)li.className="no";
+      li.innerHTML=`<span>${esc(n.ssid)}${n.supported?"":' <span class="muted">(không hỗ trợ: '+esc(n.auth)+")</span>"}</span><span class="muted">${bars(n.rssi)} ${n.rssi} dBm · k${n.channel}</span>`;
+      if(n.supported)li.onclick=()=>{$("ssid").value=n.ssid;$("pass").focus()};$("nets").appendChild(li)}}
+  catch(e){$("scanMsg").textContent="Lỗi: "+e}finally{$("scanBtn").disabled=false}};
+$("showPass").onchange=()=>$("pass").type=$("showPass").checked?"text":"password";
+$("saveWifi").onclick=async()=>{
+  const ssid=$("ssid").value,pass=$("pass").value;
+  if(!ssid){$("wifiMsg").textContent="Nhập tên Wi-Fi.";return}
+  if(pass.length<8){$("wifiMsg").textContent="Mật khẩu phải từ 8 ký tự.";return}
+  $("saveWifi").disabled=true;$("wifiMsg").innerHTML='<span class="spin"></span> Đang thử kết nối (tối đa 20 giây)…';
+  try{const r=await cmd("wifi.set "+q(ssid)+" "+q(pass),30000);
+    $("wifiMsg").innerHTML=r.ok?`<b class="okc">Đã kết nối và lưu.</b> IP ${esc(r.ip)}. Chuyển điện thoại/PC về Wi-Fi “${esc(ssid)}” rồi mở <a href="http://${esc(r.ip)}/">http://${esc(r.ip)}/</a> hoặc <b>http://dreame-bridge.local/</b>.`
+      :`<b class="badc">Không kết nối được:</b> ${esc(r.error)}. Mạng cũ vẫn được giữ.`}
+  catch(e){$("wifiMsg").innerHTML="Mất kết nối với bridge trong lúc chuyển mạng (thường gặp khi dùng AP cài đặt). Kết nối lại Wi-Fi nhà và mở <b>http://dreame-bridge.local/</b>, hoặc vào lại AP cài đặt để xem kết quả."}
+  finally{$("saveWifi").disabled=false;status()}};
+async function simple(line,msg){try{const r=await cmd(line);$("wifiMsg").textContent=r.ok?msg:"Lỗi: "+r.error}catch(e){$("wifiMsg").textContent="Lỗi: "+e}status()}
+$("apOn").onclick=()=>simple("wifi.ap on","Đã bật AP cài đặt.");
+$("apOff").onclick=()=>simple("wifi.ap off","Đã tắt AP cài đặt.");
+$("forget").onclick=()=>{if(confirm("Xoá Wi-Fi đã lưu? Bridge sẽ chuyển sang AP cài đặt."))simple("wifi.forget","Đã xoá. Kết nối vào AP cài đặt để cài lại.")};
+$("reboot").onclick=()=>{if(confirm("Khởi động lại bridge?"))simple("reboot","Đang khởi động lại…")};
+
+/* ---------- terminal ---------- */
+const log=$("log");let lineOpen=false,cur=null,logText=[];
+function stamp(){const d=new Date();return d.toTimeString().slice(0,8)+"."+String(d.getMilliseconds()).padStart(3,"0")}
+function addLine(cls,txt){const e=document.createElement("div");if(cls)e.className=cls;if($("ts").checked){const t=document.createElement("span");t.className="ts";t.textContent=stamp()+" ";e.appendChild(t)}e.appendChild(document.createTextNode(txt));log.appendChild(e);logText.push(txt);return e}
+function trim(){while(log.childNodes.length>4000)log.removeChild(log.firstChild);if($("auto").checked)log.scrollTop=log.scrollHeight}
+const hex=b=>Array.from(b,x=>x.toString(16).padStart(2,"0")).join(" ");
+function rx(bytes){
+  if($("view").value=="hex"){addLine("",hex(bytes));lineOpen=false;trim();return}
+  const s=dec.decode(bytes,{stream:true}).replace(/\r/g,"");
+  s.split("\n").forEach((p,i,parts)=>{if(i>0)lineOpen=false;if(p===""&&i==parts.length-1)return;
+    if(lineOpen&&cur){cur.lastChild.textContent+=p;logText[logText.length-1]+=p}else{cur=addLine("",p);lineOpen=true}});trim()}
+function sys(t){addLine("sys","# "+t);lineOpen=false;trim()}
+let ws=null,wsOk=false;
+function connect(){ws=new WebSocket(`ws://${location.host}/ws`);ws.binaryType="arraybuffer";
+  ws.onopen=()=>{wsOk=true;$("wsPill").classList.add("on");$("wsTxt").textContent="terminal";sys("đã kết nối terminal")};
+  ws.onclose=()=>{if(wsOk)sys("mất kết nối terminal, đang thử lại…");wsOk=false;$("wsPill").classList.remove("on");$("wsTxt").textContent="offline";setTimeout(connect,1500)};
+  ws.onmessage=e=>rx(new Uint8Array(typeof e.data=="string"?enc.encode(e.data):e.data))}
+function unesc(s){const out=[];for(let i=0;i<s.length;i++){let c=s[i];if(c=="\\"&&i+1<s.length){const n=s[i+1];
+  if(n=="x"&&/^[0-9a-fA-F]{2}$/.test(s.substr(i+2,2))){out.push(parseInt(s.substr(i+2,2),16));i+=3;continue}
+  const m={r:13,n:10,t:9,"0":0,"\\":92,'"':34}[n];if(m!==undefined){out.push(m);i++;continue}}
+  out.push(...enc.encode(c))}return new Uint8Array(out)}
+const hexBytes=s=>{s=s.replace(/0x/gi,"").replace(/[^0-9a-fA-F]/g,"");if(s.length%2)throw"số chữ số hex lẻ";const a=[];for(let i=0;i<s.length;i+=2)a.push(parseInt(s.substr(i,2),16));return new Uint8Array(a)};
+function sendBytes(b,label){if(!wsOk){sys("chưa kết nối terminal");return}ws.send(b);if($("echo").checked){addLine("tx","> "+(label??hex(b)));lineOpen=false;trim()}}
+function sendText(s,label){const b1=unesc(s),b2=unesc($("eol").value),b=new Uint8Array(b1.length+b2.length);b.set(b1);b.set(b2,b1.length);sendBytes(b,label??s)}
+let hist=store.get("hist",[]),hi=hist.length;
+function doSend(){const v=$("inp").value;try{if($("hexIn").checked)sendBytes(hexBytes(v));else sendText(v)}catch(e){sys("lỗi: "+e);return}
+  if(v&&hist[hist.length-1]!==v){hist.push(v);hist=hist.slice(-100);store.set("hist",hist)}hi=hist.length;$("inp").value=""}
+$("send").onclick=doSend;
+$("inp").onkeydown=e=>{if(e.key=="Enter")doSend();else if(e.key=="ArrowUp"){if(hi>0)$("inp").value=hist[--hi];e.preventDefault()}else if(e.key=="ArrowDown"){hi=Math.min(hist.length,hi+1);$("inp").value=hist[hi]||"";e.preventDefault()}};
+$("clr").onclick=()=>{log.innerHTML="";logText=[];lineOpen=false};
+$("saveLog").onclick=()=>{const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([logText.join("\n")],{type:"text/plain"}));a.download="robot-"+new Date().toISOString().replace(/[:.]/g,"-")+".log";a.click()};
+["view","ts","echo","auto","eol","hexIn"].forEach(k=>{const el=$(k),v=store.get("ui."+k,null);if(v!=null){if(el.type=="checkbox")el.checked=v;else el.value=v}el.onchange=()=>store.set("ui."+k,el.type=="checkbox"?el.checked:el.value)});
+const BAUDS=[9600,19200,38400,57600,115200,460800,921600,1000000,2000000];
+function setBaud(b){const sel=$("baud");sel.innerHTML="";const list=BAUDS.includes(b)?BAUDS:[...BAUDS,b].sort((x,y)=>x-y);for(const r of list){const o=document.createElement("option");o.value=o.textContent=r;sel.appendChild(o)}sel.value=b}
+$("baud").onchange=async()=>{const r=await cmd("uart.baud "+$("baud").value);sys(r.ok?"baud = "+r.baud:"lỗi: "+r.error)};
+let macros=store.get("macros",[["info","info -a"],["version","ver -t"],["help","help"]]);
+function drawMacros(){$("macros").innerHTML="";for(const[n,c]of macros){const b=document.createElement("button");b.textContent=n;b.title=c;b.onclick=()=>sendText(c,n+": "+c);$("macros").appendChild(b)}$("macroTxt").value=macros.map(m=>m[0]+" = "+m[1]).join("\n")}
+$("macroSave").onclick=()=>{macros=$("macroTxt").value.split("\n").map(l=>{const i=l.indexOf("=");return i<0?null:[l.slice(0,i).trim(),l.slice(i+1).trim()]}).filter(m=>m&&m[0]);store.set("macros",macros);drawMacros()};
+drawMacros();
+
+/* ---------- commands ---------- */
+async function runLine(){const line=$("cline").value.trim();if(!line)return;$("cout").textContent="…";
+  try{$("cout").textContent=JSON.stringify(await cmd(line),null,2)}catch(e){$("cout").textContent="lỗi: "+e}}
+$("crun").onclick=runLine;$("cline").onkeydown=e=>{if(e.key=="Enter")runLine()};
+async function loadHelp(){try{const r=await cmd("help");const t=$("cmdTable");t.innerHTML="";
+  for(const c of r.commands){const tr=t.insertRow();tr.innerHTML=`<td><code>${esc(c.cmd)}</code> <span class="muted">${esc(c.usage)}</span></td><td>${esc(c.help)}</td>`;
+    tr.querySelector("code").onclick=()=>{$("cline").value=c.cmd+(c.usage?" ":"");$("cline").focus()}}}catch(e){}}
+
+/* ---------- SWD ---------- */
+function hexdump(h,base){const b=h.match(/../g)||[];let o="";for(let i=0;i<b.length;i+=16){const row=b.slice(i,i+16);
+  o+=(base+i).toString(16).padStart(8,"0")+"  "+row.join(" ").padEnd(47)+"  "+row.map(x=>{const c=parseInt(x,16);return c>=32&&c<127?String.fromCharCode(c):"."}).join("")+"\n"}return o}
+async function swd(line){$("swdOut").textContent="> swd "+line+"\n…";
+  try{const r=await cmd("swd "+line);let o="> swd "+line+"\n"+(r.response??r.error);
+    if(r.data){const base=parseInt(line.split(/\s+/)[1])||0;o+="\n"+hexdump(r.data,base)}$("swdOut").textContent=o}catch(e){$("swdOut").textContent="lỗi: "+e}}
+for(const c of["PING","ID","DPID","PID","CTRL","HALT","RESUME","STEP"]){const b=document.createElement("button");b.textContent=c;b.onclick=()=>swd(c);$("swdBtns").appendChild(b)}
+$("rdBtn").onclick=()=>swd(`READ ${$("rdAddr").value} ${$("rdLen").value}`);
+$("swdRun").onclick=()=>{const v=$("swdLine").value.trim();if(v)swd(v)};$("swdLine").onkeydown=e=>{if(e.key=="Enter")$("swdRun").click()};
+
+tab(store.get("tab","term"));connect();status();
+</script>
+</body>
+</html>

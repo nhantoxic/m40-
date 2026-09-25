@@ -1,36 +1,53 @@
-# m40 – cầu nối Wi-Fi ↔ UART/SWD cho robot (ESP32-S2 mini)
+# m40 – cầu nối Wi-Fi ↔ UART/SWD cho robot (ESP32-S2 / ESP32-S3)
 
 | Thư mục | Nội dung |
 |---|---|
-| `firmware/esp_uart_bridge/` | Firmware ESP-IDF (PlatformIO). Xem [README firmware](firmware/esp_uart_bridge/README.md). |
-| `tools/bridge_tool.py` | CLI + GUI trên PC (chỉ cần Python 3.8+, GUI dùng tkinter có sẵn trong bản Python Windows). |
+| `firmware/esp_uart_bridge/` | Firmware ESP-IDF, có web app nhúng. Build cho **ESP32-S2** (LOLIN S2 mini) hoặc **ESP32-S3**. Xem [README firmware](firmware/esp_uart_bridge/README.md). |
+| `tools/bridge_tool.py` | CLI + MCP server trên PC. Chỉ cần Python 3.8+ (thêm `pyserial` nếu dùng `--usb`). |
+| `docs/COMMANDS.md` | Bộ lệnh chung cho web app, CLI, AI agent, HTTP và USB. |
 
-## Công cụ PC
+## Bắt đầu nhanh
 
-Không truyền `--host` thì tool thử `dreame-bridge.local` (mDNS) rồi đến UDP discovery `2326`.
+1. Nạp firmware: `pio run -e lolin_s2_mini -t upload` (hoặc `-e esp32s3`).
+2. Kết nối điện thoại vào Wi-Fi **DreameBridge-XXXX** (mật khẩu `dreame-setup`), mở
+   **http://192.168.4.1/**, chọn Wi-Fi nhà, nhập mật khẩu → *Lưu & kết nối*.
+3. Từ đó dùng **http://dreame-bridge.local/** trên điện thoại/PC, hoặc CLI bên dưới.
+
+## CLI trên PC (cùng lệnh với app)
+
+Không truyền `--host` thì tool lần lượt thử `$BRIDGE_HOST`, bridge dùng lần trước,
+`dreame-bridge.local` (mDNS), UDP discovery `2326`, rồi AP cài đặt `192.168.4.1`.
 
 ```powershell
-python tools\bridge_tool.py gui                        # giao diện: terminal, macro, SWD, trạng thái
-python tools\bridge_tool.py discover                   # liệt kê bridge trong LAN
-python tools\bridge_tool.py status                     # JSON discovery + bộ đếm lỗi UART
-python tools\bridge_tool.py term --eol crlf --log uart.log   # terminal raw; ":hex 3C 00 3E" gửi hex, ":q" thoát
-python tools\bridge_tool.py send "info -a" --wait 1    # gửi một lệnh, in phản hồi
-python tools\bridge_tool.py send "3C 00 01 01 0E 00 01 06 00 0E 08 3E" --hex --hex-out
-python tools\bridge_tool.py swd PING ID "READ 0x08000000 256"
-python tools\bridge_tool.py swd "DUMP 0x08000000 0x80000" --out mcu.bin
+python tools\bridge_tool.py status --pretty
+python tools\bridge_tool.py wifi.scan
+python tools\bridge_tool.py wifi.set "Tên Wi-Fi" "mật khẩu"
+python tools\bridge_tool.py --usb COM8 wifi.set "Tên Wi-Fi" "mật khẩu"   # qua cáp USB
+python tools\bridge_tool.py uart.baud 115200
+python tools\bridge_tool.py uart.xfer 800 "info -a\r\n"                 # gửi và lấy phản hồi (JSON)
+python tools\bridge_tool.py --text uart.xfer 800 "info -a\r\n"          # chỉ in text phản hồi
+python tools\bridge_tool.py uart.read 500
+python tools\bridge_tool.py uart.sendhex "3C 00 01 3E"
+python tools\bridge_tool.py swd ID
+python tools\bridge_tool.py swd READ 0x08000000 64
+python tools\bridge_tool.py help                                         # danh sách lệnh từ firmware
+python tools\bridge_tool.py discover                                     # các bridge trong LAN
+python tools\bridge_tool.py term                                         # terminal raw tcp/2324
+python tools\bridge_tool.py app                                          # mở web app
 ```
 
-GUI:
+Mỗi lệnh in ra một dòng JSON (`--pretty` để xuống dòng thụt lề). Mã thoát là 0 khi `"ok": true`.
 
-- **Terminal**: xem dạng text hoặc hex, chọn kết thúc dòng (none/LF/CR/CRLF), gửi hex, lịch sử
-  lệnh bằng ↑/↓, timestamp, lưu log.
-- **Macro**: mỗi dòng `tên = lệnh` thành một nút; hỗ trợ `\r \n \xHH`.
-- **SWD**: nút PING/ID/DPID/HALT/RESUME/STEP và ô lệnh tuỳ ý (READ hiện hexdump). Lệnh ghi
-  (`WRITE`/`MWRITE`) cố ý không có trong tool.
-- **Trạng thái**: hỏi UDP discovery mỗi 2 s, hiện tốc độ ↓/↑ và các bộ đếm
-  `frame_err`/`parity_err`/`fifo_ovf`/`buf_full`.
+## AI agent
+
+- **MCP**: `python tools/bridge_tool.py mcp` là một MCP server (stdio) với các tool
+  `bridge_command`, `uart_xfer`, `uart_read`, `bridge_status`, `bridge_discover`.
+  File `.mcp.json` ở gốc repo đã khai báo sẵn cho Claude Code.
+- **Không dùng MCP**: agent có thể gọi thẳng CLI ở trên, hoặc
+  `curl -H "X-Bridge: 1" --data 'uart.xfer 800 "info -a\r\n"' http://dreame-bridge.local/api/cmd`.
+- Mô tả lệnh và mẹo dùng cho agent: [`docs/COMMANDS.md`](docs/COMMANDS.md).
 
 ## Không commit
 
-`sdkconfig` và `sdkconfig.lolin_s2_mini` chứa SSID/mật khẩu Wi-Fi nên đã nằm trong
-`.gitignore`. Đổi mặc định thì sửa `sdkconfig.defaults`.
+`sdkconfig` và `sdkconfig.<env>` có thể chứa mật khẩu Wi-Fi nên đã nằm trong `.gitignore`.
+Đổi mặc định thì sửa `sdkconfig.defaults*`.

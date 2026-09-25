@@ -1,254 +1,147 @@
 # esp_uart_bridge
 
-Cầu **UART ↔ TCP** cho cổng debug của robot Dreame, kèm một cổng
-**OpenOCD remote-bitbang ↔ SWD**. Có hai kênh UART độc lập: console SoC và UART
-tham số của MCU ARM.
+Cầu **Wi-Fi ↔ UART/SWD** cho robot (cổng debug MCU), chạy trên **ESP32-S2** (LOLIN S2 mini)
+hoặc **ESP32-S3** (DevKitC-1 / module S3). Có sẵn:
 
-Profile UART-only đang chạy: UART1 trên GPIO35/33, TCP `2324`, `230400 8N1`;
-UART0 phụ bị tắt. Đây là cấu hình đầu ESP; đường vật lý tới UART ứng dụng MCU
-chưa được xác nhận. App bridge mới đã nạp qua COM5 vào offset `0x10000` và xác
-minh hash thành công. `info -a` và `ver -t` đã được gửi qua TCP nhưng không có
-byte trả lời; xem báo cáo live ở
-[`BRIDGE_RECHECK_20260923.md`](../../BRIDGE_RECHECK_20260923.md).
-IP là DHCP-assigned; các tool SWD/UART tự dò qua UDP `2326` khi không truyền
-`--host`.
+- **Web app** nhúng trong firmware (`http://dreame-bridge.local/`): cài Wi-Fi, terminal UART,
+  macro, chạy lệnh, SWD. Mở được trên điện thoại hoặc PC, không cần cài gì.
+- **Một bộ lệnh chung** cho web app, CLI trên PC, AI agent (MCP) và USB — xem
+  [`docs/COMMANDS.md`](../../docs/COMMANDS.md).
+- Cổng TCP raw cũ (`2324` UART, `2325` SWD text, `3335` OpenOCD remote-bitbang) và UDP
+  discovery `2326`, vẫn tương thích với RobotMonitor.
 
-Biên dịch được cho cả `esp32s2` (LOLIN S2 mini) và `esp32s3` (DevKitC-1, và sau này là
-module trên bo Rev A).
+## Chọn chip
 
-## Áp dụng bản tối ưu (2026-09-25)
+| | ESP32-S2 (LOLIN S2 mini) | ESP32-S3 (DevKitC-1) |
+|---|---|---|
+| Env PlatformIO | `lolin_s2_mini` | `esp32s3` |
+| CPU | 1 nhân, 240 MHz | 2 nhân, 240 MHz: Wi-Fi/lwIP ở core 0, bơm UART + SWD bit-bang ở core 1 |
+| Heap lúc chạy | ~150 KB | ~240 KB |
+| Bộ đệm | UART ring 8 KB, `uart.read` 4 KB, TCP window 5,7 KB | UART ring 16 KB, `uart.read` 16 KB, TCP window 11,5 KB, `swd READ` tối đa 16 KB |
+| USB | ROM USB-CDC (DTR=0, RTS=1 mới có dữ liệu) | USB-Serial-JTAG |
+| UART robot | TX **GPIO35**, RX **GPIO33** | TX **GPIO17**, RX **GPIO21** |
+| SWD | SWDIO **GPIO16**, SWCLK **GPIO18** | SWDIO **GPIO16**, SWCLK **GPIO18** |
+| LED trạng thái | GPIO15 | không (LED RGB địa chỉ) |
+| Nút cài đặt | BOOT (GPIO0) | BOOT (GPIO0) |
 
-PlatformIO đọc cấu hình từ `sdkconfig.lolin_s2_mini` (file này chứa mật khẩu Wi-Fi, không
-commit). `sdkconfig.defaults` chỉ áp dụng khi file đó được tạo mới, nên với file sẵn có hãy
-thêm/sửa các dòng sau (hoặc chọn trong `pio run -t menuconfig`):
+Chân nằm trong `sdkconfig.defaults.esp32s2` / `sdkconfig.defaults.esp32s3`. Trên module S3
+có PSRAM octal (N8R8/N16R8) thì **không** dùng GPIO35–37. Mắc điện trở 1 kΩ nối tiếp trên
+TX/RX và SWD sau khi đã xác nhận chân phía robot.
 
-```text
-CONFIG_COMPILER_OPTIMIZATION_PERF=y          # thay cho CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y        # thay cho ..._160=y
-CONFIG_LWIP_IRAM_OPTIMIZATION=y
-CONFIG_BRIDGE_MDNS_ENABLE=y
+UART mặc định **115200 8N1**; đổi lúc chạy bằng `uart.baud <rate>` (được lưu lại).
+
+## Build và nạp
+
+```powershell
+cd firmware\esp_uart_bridge
+pio run -e lolin_s2_mini -t upload --upload-port COM5     # S2: giữ BOOT, nhấn RESET nếu không thấy cổng
+pio run -e esp32s3 -t upload                              # S3
 ```
 
-Lần build đầu sẽ tải managed component `espressif/mdns` (khai báo trong
-`main/idf_component.yml`), cần Internet.
-
-## Xây dựng
+Hoặc dùng ESP-IDF trực tiếp (cần **v6.x**; đã build thử với v6.1):
 
 ```bash
-cd firmware/esp_uart_bridge
-idf.py set-target esp32s2          # hoặc esp32s3
-idf.py menuconfig                  # → "Dreame bridge configuration"
-idf.py build
-idf.py -p COM5 flash monitor       # Linux: -p /dev/ttyACM0
+idf.py set-target esp32s2      # hoặc esp32s3
+idf.py build flash monitor
 ```
 
-Yêu cầu ESP-IDF **v5.0 trở lên** (dùng `UART_SCLK_DEFAULT` và
-`esp_event_handler_instance_register`).
+Lần build đầu sẽ tải component `espressif/mdns` (cần Internet). ESP-IDF đọc
+`sdkconfig.defaults` rồi `sdkconfig.defaults.<chip>`. **Các file này chỉ có tác dụng khi
+`sdkconfig.<env>` được tạo mới.** Nếu bạn đang có sẵn `sdkconfig.lolin_s2_mini` từ firmware cũ,
+hãy xoá nó (Wi-Fi giờ được cài qua app nên file này không còn cần giữ mật khẩu) hoặc sửa bằng
+`pio run -e lolin_s2_mini -t menuconfig`.
 
-## Cấu hình
+## Lần đầu: cài Wi-Fi bằng app
 
-Toàn bộ nằm trong `menuconfig` → *Dreame bridge configuration*:
+1. Cấp nguồn. Khi chưa có Wi-Fi (hoặc mất Wi-Fi quá 30 s, hoặc giữ nút **BOOT 3 s**), bridge
+   phát AP **`DreameBridge-XXXX`**, mật khẩu **`dreame-setup`** (đổi trong menuconfig:
+   *Setup access point password*). LED nháy đôi.
+2. Điện thoại/PC kết nối vào AP đó, mở **http://192.168.4.1/** → tab **Wi-Fi** → *Quét mạng*
+   → chọn mạng nhà → nhập mật khẩu → **Lưu & kết nối**.
+3. Bridge thử kết nối. Chỉ khi **nhận được IP** thì mạng mới được lưu. Sai mật khẩu hay không
+   thấy mạng thì app báo lý do, mạng cũ vẫn giữ nguyên. Nhận IP xong, điện thoại có thể bị
+   ngắt khỏi AP cài đặt (AP chuyển sang kênh của router): cứ quay về Wi-Fi nhà rồi mở
+   **http://dreame-bridge.local/** (hoặc IP được báo).
+4. AP cài đặt tự tắt 30 s sau khi đã vào mạng nhà và không còn ai kết nối vào nó.
 
-| Mục | Mặc định | Ghi chú |
-|---|---|---|
-| Wi-Fi SSID / password | `changeme` | **Bắt buộc đặt mật khẩu WPA2 tối thiểu 8 ký tự.** Lưu trong sdkconfig, không commit. |
-| Wi-Fi SSID dự phòng | rỗng | Tùy chọn. Sau `MAX_RETRY` lần fail ở SSID chính, bridge tự chuyển sang SSID này với **cùng mật khẩu**. Board nằm trong robot nên không sửa SSID bằng tay được: một lỗi gõ tên mạng hoặc một AP chỉ phủ một phần khu vực sẽ làm mất kết nối vĩnh viễn nếu không có đường lui. |
-| Hostname | `dreame-bridge` | Tra IP trên router bằng tên này |
-| LAN discovery UDP | `2326` | RobotMonitor gửi broadcast để tự tìm ESP trong cùng mạng |
-| Primary TCP port / UART | `2324` / UART1 | Raw UART tại GPIO35 ESP TX / GPIO33 ESP RX. Điểm cuối robot chưa xác nhận là MCU UART; trang X40 page 18 ghi SoC RX/TX. |
-| Primary UART baud | `230400 8N1` | Cấu hình ESP hiện tại; chưa xác minh baud của đường nối MCU CLI trên máy đang thử. |
-| UART0 phụ | tắt | Chỉ bật trong profile dual-UART; GPIO16/18 không được đồng thời dùng cho UART SoC và SWD |
-| OpenOCD remote-bitbang TCP | `3335` | SWDIO GPIO16, SWCLK GPIO18; không có NRST |
-| SWD text TCP | `2325` | Có ID/READ/DUMP, core debug, ghi SRAM và ghi Flash; không phải API read-only |
-| Software flow control (`ixoff`) | off | Chỉ bật sau khi xác nhận robot hiểu XON/XOFF; nó gửi XOFF tại 96 byte FIFO và XON tại 32 byte. |
-| LED GPIO | `15` | S2 mini. Đặt `-1` trên S3 DevKitC (LED ở đó là RGB addressable). |
+Cách khác: cắm USB và chạy `python tools/bridge_tool.py --usb COM8 wifi.set "Tên Wi-Fi" "mật khẩu"`.
+
+Chỉ nhận mạng WPA2/WPA3 (mật khẩu 8–63 ký tự); mạng mở bị từ chối.
 
 ## Dùng
 
-```powershell
-# Tự dò IP qua UDP 2326 rồi đọc ID SWD:
-python tools\swd_probe.py id
+- **Web app**: `http://dreame-bridge.local/` (hoặc IP). Các tab: Wi-Fi, Terminal (WebSocket,
+  xem text/hex, CR/LF/CRLF, gửi hex, lịch sử ↑/↓, macro, đổi baud, lưu log), Lệnh / API, SWD.
+- **PC / AI agent**: `tools/bridge_tool.py` — cùng lệnh với app. Xem
+  [README gốc](../../README.md) và [`docs/COMMANDS.md`](../../docs/COMMANDS.md).
+- **Raw TCP** (RobotMonitor, YMODEM, PuTTY chế độ *Raw*, **không phải Telnet**): `2324`.
+  Client mới sẽ chiếm quyền client cũ.
+- **SWD text** `2325`: nhiều lệnh trên một kết nối, đóng khi rỗi 60 s.
+- **OpenOCD** `3335` (remote_bitbang, không có NRST → `reset_config none`):
 
-# Tự dò IP rồi hỏi CLI MCU (lệnh chỉ đọc thông tin):
-python tools\mcu_identity_probe.py
-```
+  ```text
+  adapter driver remote_bitbang
+  remote_bitbang host dreame-bridge.local
+  remote_bitbang port 3335
+  transport select swd
+  reset_config none
+  ```
 
-Discovery live gần nhất trả `192.168.1.36`, MAC `48:F6:EE:6B:05:26`.
-Địa chỉ do DHCP cấp nên có thể đổi; dùng nút **Quét ESP** trong RobotMonitor
-hoặc để các tool tự dò thay vì sao chép một IP cũ.
+  Khi OpenOCD đang kết nối, lệnh `swd ...` từ app/CLI báo *busy*.
 
-### Chọn mạng Wi-Fi
-
-Log khởi động in ra mọi AP trong tầm ngay trước khi kết nối, nên không cần
-đoán xem board có nhìn thấy mạng hay không:
-
-```text
-I (2842) wifi: scan: 18 AP(s) visible
-I (2842) wifi:   ssid="Ongtrumnoitro.com VT" rssi=-59 ch=3 auth=4
-I (2844) wifi:   ssid="Ongtrumnoitro.com VN" rssi=-83 ch=10 auth=4
-I (2850) wifi: joining "Ongtrumnoitro.com VT"
-I (3000) wifi:connected with Ongtrumnoitro.com VT, aid = 13, channel 3, 40U, bssid = 30:42:40:eb:9d:68
-```
-
-Máy tính quét bằng `netsh wlan show networks` có thể chỉ thấy một nửa số SSID mà
-bridge thấy, vì adapter PC ở xa AP hơn hoặc kết quả bị cache. Log trên board là
-nguồn đúng khi hai bên không khớp.
-
-Cả hai cổng đều là raw TCP, **không phải Telnet**: không thương lượng IAC, không đổi CR/LF.
-Byte vào sao thì byte ra vậy — cần thiết cho shell SoC và giao thức RobotMonitor.
-PuTTY phải chọn chế độ **Raw**.
-
-### Đọc log của bridge qua USB CDC
-
-Console ESP-IDF nằm trên USB CDC của S2 mini, nhưng driver CDC của ROM chỉ phát TX
-khi đường điều khiển ở đúng mức: **DTR = 0, RTS = 1**. Để nguyên mặc định của
-pyserial/`pio device monitor` sẽ mở được cổng mà không thấy byte nào.
-
-```python
-import serial
-s = serial.Serial("COM5", 115200, timeout=0.2)
-s.dtr = False
-s.rts = True          # bắt đầu thấy log
-print(s.read(8192))
-```
-
-Đừng hạ RTS từ 1 xuống 0 khi DTR = 0 ngoài ý muốn: theo `usb_console.c` của
-ESP-IDF, cạnh xuống đó là lệnh **reboot bình thường** (và nếu DTR = 1 thì là
-reboot vào bootloader). Đóng cổng bằng pyserial cũng tạo cạnh xuống này, nên
-board sẽ khởi động lại sau mỗi lần đóng cổng và mất vài giây để vào lại Wi-Fi.
-
-### Dùng xPack OpenOCD qua SWD
-
-Cổng TCP `3335` không phải UART raw. Nó dùng giao thức `remote_bitbang` của OpenOCD:
-OpenOCD gửi từng mức SWCLK/SWDIO qua Wi-Fi, ESP32-S2 phát chúng trên GPIO18/GPIO16.
-Do robot không đưa NRST ra đầu nối, cấu hình probe dùng `reset_config none`.
-
-Ví dụ với xPack OpenOCD Windows:
-
-```powershell
-$ocd = 'tmp\openocd-xpack\xpack-openocd-0.12.0-7'
-& "$ocd\bin\openocd.exe" -s "$ocd\openocd\scripts" `
-  -f tools\openocd_remote_swd_probe.cfg
-```
-
-Cấu hình OpenOCD mẫu chỉ đọc DAP-ID; nó chưa khai báo lệnh ghi. Riêng TCP
-`2325` còn có lệnh điều khiển core, ghi SRAM và ghi Flash; coi các cổng debug
-này là có quyền sửa MCU. `ID` báo clock cấu hình của engine nội bộ (bản live
-đã đọc `1000 kHz`). Remote-bitbang `3335` có timing do OpenOCD và độ trễ mạng
-điều khiển; baud UART không áp dụng cho SWD.
-
-### Chế độ tạm thời: UART1 trên GPIO35/33
-
-Theo hàng chân thực tế của S2 mini, GPIO16/GPIO18 nối vào SWDIO/SWCLK và không được dùng làm
-UART. Firmware tạm dùng UART1 trên GPIO35/33, nhưng đầu robot của cặp dây này chưa được
-định danh. UART0 phụ bị tắt. Cấu hình tạm hiện tại là:
-
-```text
-GPIO16             → SWDIO (không drive bằng UART)
-GPIO18             → SWCLK (không drive bằng UART)
-UART1, GPIO35/33   → UART thô (ESP TX/RX; target robot chưa xác nhận), 230400 8N1
-TCP 2324             → RobotMonitor/raw client / YMODEM sender
-UART0 phụ            → tắt
-```
-
-Các phép thử live gần nhất trên máy này nhận 0 byte cho `info -a` và `ver -t`.
-Lần chạy trước có 176 byte RX nhưng bridge đã bỏ chúng khi chưa có client nên
-không thể xem nội dung. Firmware đang nằm trong Flash có mục lệnh `info` và
-nhánh xử lý đối số `-a`, vì vậy sự im lặng là lỗi đường giao tiếp hoặc trạng
-thái MCU, không phải bằng chứng rằng lệnh không tồn tại. Hình X40 page 18 chỉ
-ghi SoC RX/TX; hãy xác nhận pin MCU UART trước khi xem GPIO35/33 là đường MCU.
-Để bắt thông báo khi target khởi động, mở capture trước rồi mới bật robot:
-
-```powershell
-python tools\capture_mcu_uart.py --seconds 120
-python tools\mcu_identity_probe.py
-```
-
-Để nghe trên cổng COM trực tiếp thay vì bridge:
-
-```powershell
-python tools\mcu_identity_probe.py --port COM8 --baud 230400
-```
-
-Nếu cần quay lại dual-UART, trả UART1 về SoC GPIO16/18, bật `BRIDGE_MCU_UART_ENABLE`,
-giữ UART0 ở GPIO35/33 và dùng TCP2323 cho SoC, TCP2324 cho MCU.
-
-Đèn LED:
+### LED (S2)
 
 | Trạng thái | Ý nghĩa |
 |---|---|
-| Nháy nhanh (100 ms) | đang vào Wi-Fi, hoặc vừa mất kết nối |
-| Nháy chậm (1 s) | đã có IP, đang chờ client |
-| Sáng liên tục | đang có client |
+| Nháy nhanh (100 ms) | đang vào Wi-Fi / vừa mất kết nối |
+| Nháy đôi | AP cài đặt đang bật |
+| Nháy chậm (1 s) | đã vào mạng, chưa có client TCP |
+| Sáng liên tục | có client trên cổng UART 2324 |
 
-## Thiết kế
+### Log qua USB
 
-- **Một client tại một thời điểm trên mỗi kênh; client mới chiếm quyền client cũ.** Sau khi
-  Wi-Fi rớt, socket cũ ở trạng thái half-open; trước đây nó giữ cổng tới khi keepalive mặc
-  định của lwIP bỏ cuộc (~2 giờ). Keepalive giờ là 5 s + 3 × 2 s.
-- **Hai task, không polling.** `uart_rx` là task duy nhất đọc UART, thức dậy theo event queue
-  của driver (trễ ≈ RX timeout 10 ký tự, ~0,4 ms ở 230400) và đếm lỗi đường truyền cả khi
-  không có client. `uart_tcp` chờ `select()` không timeout và đẩy byte TCP xuống UART.
-- **`send()` được lặp cho tới hết.** `send()` trả về thiếu là chuyện bình thường; mất đuôi
-  một dòng giữa phiên shell là loại lỗi sẽ bị đổ cho robot suốt mấy tuần.
-- **Xả bộ đệm UART khi có client mới** (tắt được). Nếu không, thứ đầu tiên người dùng thấy
-  là một mẩu log cụt của mười phút trước — trông y hệt một cú crash đang diễn ra.
-  Khi tắt `BRIDGE_FLUSH_ON_CONNECT`, bridge giữ `BRIDGE_UART_BACKLOG` byte mới nhất
-  (mặc định 4096) nhận được lúc chưa có client và gửi chúng trước tiên khi client kết nối.
-- **SWD text `2325` nhận nhiều lệnh trên một kết nối.** Client cũ kiểu "mỗi lệnh một kết nối"
-  vẫn chạy. Kết nối bị đóng khi rỗi 60 s hoặc khi một lệnh nhị phân bị cắt giữa chừng
-  (READ/DUMP/WRITE/MWRITE), vì khi đó luồng byte không còn khớp khung lệnh.
-- **`ixoff` là tuỳ chọn, mặc định tắt.** Nó có thể giảm nguy cơ tràn khi robot phát log quá
-  nhanh, nhưng chỉ an toàn nếu robot thực sự dừng phát khi nhận XOFF; nếu không, hai byte
-  điều khiển có thể đi vào console như dữ liệu thường.
-- **Không có AP fallback, không có portal cấu hình.** Một AP mở dẫn thẳng vào console root
-  còn tệ hơn là gõ sai SSID.
+- **S2** (ROM USB-CDC): chỉ phát dữ liệu khi **DTR = 0, RTS = 1**. RTS đi từ 1 xuống 0 (kể cả
+  lúc đóng cổng) sẽ **reboot** board; cài đặt thì vẫn giữ nguyên.
+- **S3** (USB-Serial-JTAG): để DTR = RTS = 0; RTS = 1 sẽ giữ chip ở trạng thái reset.
 
-## LAN discovery cho RobotMonitor
+`bridge_tool.py --usb` tự nhận ra loại chip qua USB VID:PID.
 
-ESP chạy station mode và chỉ gia nhập AP khi có mật khẩu WPA2 hợp lệ; không có
-AP mở hoặc portal cấu hình. Sau khi nhận IP, firmware lắng nghe UDP `2326`.
-RobotMonitor gửi chuỗi `DREAME_BRIDGE_DISCOVER` và ESP trả JSON chứa hostname,
-IP, MAC, `uart_port` (kênh primary), `mcu_port` (kênh được cấu hình làm MCU), `uart_mode` và các
-cổng SWD. Ở chế độ dual-UART, `uart_port`=`2323` (SoC) còn `mcu_port`=`2324`;
-RobotMonitor ưu tiên `mcu_port`. Mật khẩu Wi-Fi không bao giờ được gửi trong
-bản tin discovery.
+### LAN discovery (UDP 2326)
 
-Bản tin còn kèm chẩn đoán vật lý, dùng để tách lỗi dây khỏi lỗi giao thức:
-
-```json
-{
-  "uart_baud": 230400,
-  "uart_tx_level": 1, "uart_rx_level": 1,
-  "uart_stats": {
-    "rx_bytes": 0, "tx_bytes": 28, "frame_err": 0,
-    "parity_err": 0, "break": 0, "fifo_ovf": 0, "buf_full": 0
-  }
-}
-```
-
-`uart_tx_level` / `uart_rx_level` là mức GPIO tại thời điểm trả lời; UART idle
-bình thường là `1`. `uart_stats` là bộ đếm từ lúc boot và đọc được cả khi không
-có client TCP nào. Cách đọc:
+Gửi `DREAME_BRIDGE_DISCOVER` → JSON gồm `name`, `ip`, `mac`, `uart_port`, `uart_baud`,
+`uart_mode`, `swd_port`, `bitbang_port`, `http_port`, `setup_ap`, `uart_tx_level`,
+`uart_rx_level` và `uart_stats`. Cách đọc bộ đếm (cũng có trong `status`):
 
 | Quan sát | Kết luận |
 |---|---|
-| `rx_bytes` tăng | ESP UART đã giải mã byte ở cặp GPIO/tốc độ hiện tại. Chưa xác nhận byte đến từ MCU; có thể là SoC, loopback hoặc nguồn khác. |
-| `frame_err` hoặc `parity_err` tăng trong khi `rx_bytes` gần 0 | ESP RX gặp tín hiệu không giải mã được; có thể sai baud/parity, nhiễu hoặc sai nguồn tín hiệu. |
-| `rx_bytes` = 0 và mọi bộ đếm lỗi = 0 | Không có byte hợp lệ được giải mã; có thể do đường dây, đối tác im lặng/ngủ, hoặc đang nghe nhầm UART. Chưa kết luận được nguyên nhân. |
-| `tx_bytes` tăng khi gửi qua TCP | TCP → ESP UART driver đã nhận byte. Chưa chứng minh mức tín hiệu trên chân hoặc MCU đã nhận. |
+| `rx_bytes` tăng | ESP đã giải mã được byte ở cặp chân/baud hiện tại (chưa chứng minh byte đến từ MCU). |
+| `frame_err`/`parity_err` tăng, `rx_bytes` gần 0 | Có tín hiệu nhưng sai baud/parity, nhiễu, hoặc sai nguồn. |
+| mọi bộ đếm = 0 | Không có byte hợp lệ: dây, đối tác im/ngủ, hoặc nghe nhầm UART. |
+| `tx_bytes` tăng khi gửi | Driver UART của ESP đã nhận byte (chưa chứng minh MCU đã nhận). |
+| `fifo_ovf`/`buf_full` tăng | Robot gửi nhanh hơn tốc độ bridge chuyển đi. |
 
-## Chưa có
+## Thiết kế và tối ưu
 
-- ADB / USB host. SWD remote-bitbang đã được triển khai trên TCP `3335`; sơ đồ dây hiện
-  tại dùng GPIO16 = SWDIO, GPIO18 = SWCLK. GPIO37 có thể dành cho NRST tùy chọn; GPIO39
-  để VTREF cảm nhận hoặc để hở. Không dùng GPIO19/20 vì đó là USB native của S2 mini.
-- Xác thực ứng dụng/TLS. Wi-Fi đã bắt buộc WPA2, nhưng TCP raw vẫn không có
-  mật khẩu thứ hai; chỉ dùng trong LAN tin cậy hoặc VLAN riêng.
-- OTA. Bo còn nằm trong tầm tay khi đang phát triển.
+- **Wi-Fi không chặn lúc boot.** Mọi dịch vụ lắng nghe trên cả mạng nhà lẫn AP cài đặt. Wi-Fi
+  tự kết nối lại (1 s → 5 s → 15 s), `WIFI_PS_NONE` (tắt modem-sleep), tự chọn AP mạnh nhất
+  khi nhà có mesh/extender, driver không ghi flash mỗi lần đổi cấu hình (`WIFI_STORAGE_RAM`).
+- **Không polling.** Mỗi kênh UART có hai task chặn: `uart_rx` là task duy nhất đọc UART, thức
+  theo event của driver với RX timeout 4 ký tự (~0,35 ms ở 115200) rồi phát tới client TCP,
+  WebSocket và bộ đệm `uart.read`; `uart_tcp` dùng `select()` không timeout.
+- **Client mới chiếm quyền** cổng 2324; keepalive 5 s + 3 × 2 s phát hiện client chết trong
+  ~11 s (mặc định lwIP là 2 giờ).
+- **Lệnh HTTP chạy trên task riêng**, nên một `uart.xfer`/`wifi.set` dài không làm treo terminal.
+- **SWD**: lệnh text đọc theo lô (không còn 1 `recv()` mỗi byte), nhiều lệnh/kết nối;
+  remote-bitbang gom `recv`/`send` và ghi thẳng thanh ghi GPIO. Trên S3 chạy ở core 1.
+- **Build**: `-O2`, CPU 240 MHz, lwIP trong IRAM, ISR UART trong IRAM (không tràn FIFO khi đang
+  ghi NVS), phân vùng app 1,5 MB (offset NVS giữ nguyên nên cài đặt không mất).
+- **`send()` được lặp tới hết**, không đổi CR/LF, không Telnet: byte vào sao thì ra vậy.
 
-## Cảnh báo
+## Bảo mật
 
-Firmware này yêu cầu mật khẩu để gia nhập Wi-Fi, nhưng **bất kỳ thiết bị nào
-đã ở cùng LAN** vẫn có thể truy cập UART raw và API SWD có lệnh ghi. Chỉ cấp
-nguồn khi cần dùng, hoặc đặt vào VLAN riêng.
+- AP cài đặt có WPA2 và chỉ bật khi cần. Nhưng ai biết mật khẩu AP thì truy cập được UART/SWD,
+  nên hãy **đổi `BRIDGE_SETUP_AP_PASSWORD`**.
+- Trong LAN, HTTP/TCP **không có mật khẩu ứng dụng**. Bất kỳ ai trong cùng mạng đều gửi lệnh
+  được, kể cả lệnh ghi SRAM/Flash qua cổng SWD 2325. Chỉ dùng trong LAN tin cậy hoặc VLAN riêng.
+- Riêng trình duyệt: `/api/cmd` bắt buộc header `X-Bridge` và WebSocket kiểm tra `Origin`, để
+  một trang web lạ đang mở trên máy bạn không điều khiển được robot.

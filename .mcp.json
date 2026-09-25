@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "dreame-bridge": {
+      "command": "python",
+      "args": ["tools/bridge_tool.py", "mcp"]
+    }
+  }
+}

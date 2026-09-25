@@ -14,7 +14,7 @@
 
 #include "discovery.h"
 #include "uart_tcp_bridge.h"
-#include "wifi_sta.h"
+#include "wifi_mgr.h"
 
 static const char *TAG = "discovery";
 static const char QUERY[] = "DREAME_BRIDGE_DISCOVER";
@@ -77,7 +77,7 @@ static void discovery_task(void *arg)
 #else
         const int mcu_port = CONFIG_BRIDGE_TCP_PORT;
         const int report_channel = 0;
-        const int report_baud = CONFIG_BRIDGE_UART_BAUD;
+        const int report_baud = uart_tcp_bridge_baud();
         const int report_tx_gpio = CONFIG_BRIDGE_UART_TX_GPIO;
         const int report_rx_gpio = CONFIG_BRIDGE_UART_RX_GPIO;
 #ifdef CONFIG_BRIDGE_UART_EVEN_PARITY
@@ -99,11 +99,12 @@ static void discovery_task(void *arg)
             "\"uart_port\":%d,\"mcu_port\":%d,\"uart_mode\":\"%s\","
             "\"uart_baud\":%d,\"tx_gpio\":%d,\"rx_gpio\":%d,"
             "\"uart_tx_level\":%d,\"uart_rx_level\":%d,"
-            "\"swd_port\":%d,\"bitbang_port\":%d,"
+            "\"swd_port\":%d,\"bitbang_port\":%d,\"http_port\":80,\"setup_ap\":%s,"
             "\"uart_stats\":{\"rx_bytes\":%u,\"tx_bytes\":%u,"
             "\"frame_err\":%u,\"parity_err\":%u,\"break\":%u,"
             "\"fifo_ovf\":%u,\"buf_full\":%u}}\n",
-            CONFIG_BRIDGE_HOSTNAME, wifi_sta_ip(),
+            CONFIG_BRIDGE_HOSTNAME,
+            wifi_mgr_sta_up() ? wifi_mgr_ip() : (wifi_mgr_ap_active() ? "192.168.4.1" : "0.0.0.0"),
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             CONFIG_BRIDGE_TCP_PORT, mcu_port, uart_mode,
             report_baud,
@@ -112,6 +113,7 @@ static void discovery_task(void *arg)
             gpio_get_level(report_rx_gpio),
             CONFIG_BRIDGE_SWD_TCP_PORT,
             CONFIG_BRIDGE_SWD_REMOTE_BITBANG_TCP_PORT,
+            wifi_mgr_ap_active() ? "true" : "false",
             (unsigned)stats.rx_bytes, (unsigned)stats.tx_bytes,
             (unsigned)stats.frame_err, (unsigned)stats.parity_err,
             (unsigned)stats.break_evt, (unsigned)stats.fifo_ovf,

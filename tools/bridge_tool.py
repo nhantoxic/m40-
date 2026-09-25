@@ -1,86 +1,103 @@
 #!/usr/bin/env python3
-"""PC-side CLI + GUI for the ESP32-S2 esp_uart_bridge firmware.
+"""PC client for the ESP32-S2 Dreame bridge: CLI, raw terminal and MCP server.
 
-Standard library only (Python 3.8+). The GUI needs tkinter, which ships with
-the python.org Windows installer.
+The bridge firmware defines ONE command language, used identically by the web
+app, this CLI, AI agents (MCP) and USB. Any command the firmware knows is
+passed through unchanged:
 
-    python bridge_tool.py discover                  # find bridges on the LAN
-    python bridge_tool.py status                    # counters of one bridge
-    python bridge_tool.py term                      # interactive raw UART terminal
-    python bridge_tool.py send "info -a" --wait 1   # one command, print reply
-    python bridge_tool.py send "3C 00 01 3E" --hex
-    python bridge_tool.py swd PING ID "READ 0x08000000 64"
-    python bridge_tool.py gui                       # graphical console
+    python bridge_tool.py help                          # list firmware commands
+    python bridge_tool.py status
+    python bridge_tool.py wifi.scan
+    python bridge_tool.py wifi.set "My Wi-Fi" "password123"
+    python bridge_tool.py uart.baud 115200
+    python bridge_tool.py uart.xfer 800 "info -a\\r\\n"   # send, return the reply
+    python bridge_tool.py uart.send "ver -t\\r\\n"
+    python bridge_tool.py uart.read 500
+    python bridge_tool.py uart.sendhex "3C 00 01 3E"
+    python bridge_tool.py swd ID
+    python bridge_tool.py swd READ 0x08000000 64
 
---host is optional everywhere: without it the tool tries dreame-bridge.local,
-then a UDP broadcast discovery.
+Local commands (run on the PC):
+
+    discover     list bridges on the LAN (UDP 2326)
+    term         interactive raw terminal on tcp/2324
+    app          open the web app in a browser
+    mcp          run as an MCP server on stdio (for AI agents)
+
+Output is one JSON object per command (--pretty to indent, --text to print only
+the received UART text). Exit status: 0 when "ok" is true, 1 otherwise.
+
+Bridge address: --host, else $BRIDGE_HOST, else the last bridge used, else
+dreame-bridge.local, else UDP discovery, else the setup AP (192.168.4.1).
+--usb COM8 sends the same commands over the USB cable instead (needs
+pyserial; handy for the first Wi-Fi setup).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import queue
-import re
+import os
 import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 from typing import Callable, Optional
 
+VERSION = "2.0"
 DISCOVERY_PORT = 2326
 DISCOVERY_QUERY = b"DREAME_BRIDGE_DISCOVER"
-DEFAULT_HOSTNAME = "dreame-bridge.local"
-DEFAULT_UART_PORT = 2324
-DEFAULT_SWD_PORT = 2325
+MDNS_NAME = "dreame-bridge.local"
+SETUP_AP_IP = "192.168.4.1"
+UART_PORT = 2324
+CMD_TIMEOUT = 45.0
+CACHE_FILE = Path.home() / ".dreame_bridge_host"
 
-EOLS = {"none": b"", "lf": b"\n", "cr": b"\r", "crlf": b"\r\n"}
-
-
-# --------------------------------------------------------------------------- helpers
-
-def parse_hex(text: str) -> bytes:
-    """'3C 00 0x01,3e' -> b'<\\x00\\x01>'"""
-    cleaned = text.replace("0x", "").replace("0X", "")
-    digits = "".join(c for c in cleaned if c in "0123456789abcdefABCDEF")
-    if len(digits) % 2:
-        raise ValueError("odd number of hex digits")
-    return bytes.fromhex(digits)
+# Commands whose last argument is raw data (escapes like \r\n are interpreted
+# by the firmware), so backslashes must be passed through untouched.
+DATA_COMMANDS = {"uart.send", "uart.sendhex", "uart.xfer", "swd"}
 
 
-def unescape(text: str) -> bytes:
-    r"""Text with \n \r \t \xHH \\ escapes -> bytes (UTF-8 for other characters)."""
-    out = bytearray()
-    i = 0
-    while i < len(text):
-        c = text[i]
-        if c == "\\" and i + 1 < len(text):
-            n = text[i + 1]
-            if n in "nrt\\":
-                out += {"n": b"\n", "r": b"\r", "t": b"\t", "\\": b"\\"}[n]
-                i += 2
-                continue
-            if n == "x" and re.fullmatch(r"[0-9a-fA-F]{2}", text[i + 2:i + 4]):
-                out.append(int(text[i + 2:i + 4], 16))
-                i += 4
-                continue
-        out += c.encode("utf-8")
-        i += 1
-    return bytes(out)
+class BridgeError(Exception):
+    pass
 
 
-def hexdump(data: bytes, base: int = 0) -> str:
-    lines = []
-    for off in range(0, len(data), 16):
-        row = data[off:off + 16]
-        hx = " ".join(f"{b:02x}" for b in row)
-        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
-        lines.append(f"{base + off:08x}  {hx:<47}  {asc}")
-    return "\n".join(lines)
+# --------------------------------------------------------------------------- command line building
 
+def quote_token(arg: str) -> str:
+    """Quote for the firmware tokenizer (wifi.set etc.): \\ and " escaped."""
+    if arg and not any(c in arg for c in ' \t"\\'):
+        return arg
+    return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def quote_data(arg: str) -> str:
+    """Quote a data argument: keep \\r \\n \\xHH escapes for the firmware."""
+    if arg and not any(c in arg for c in ' \t"') and not (arg.startswith('"') and arg.endswith('"')):
+        return arg
+    return '"' + arg.replace('"', '\\"') + '"'
+
+
+def build_line(argv: list[str]) -> str:
+    """['wifi.set', 'My Wi-Fi', 'pw'] -> 'wifi.set "My Wi-Fi" pw'."""
+    if not argv:
+        raise BridgeError("empty command")
+    name, args = argv[0], argv[1:]
+    if name in DATA_COMMANDS:
+        if name == "uart.xfer" and args:
+            return " ".join([name, args[0]] + ([quote_data(" ".join(args[1:]))] if args[1:] else []))
+        if name == "swd":
+            return " ".join([name] + args)
+        return " ".join([name] + ([quote_data(" ".join(args))] if args else []))
+    return " ".join([name] + [quote_token(a) for a in args])
+
+
+# --------------------------------------------------------------------------- discovery
 
 def discover(timeout: float = 1.5, target: str = "255.255.255.255") -> list[dict]:
-    """Broadcast (or unicast to `target`) the discovery query; return replies."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.settimeout(0.2)
@@ -93,687 +110,399 @@ def discover(timeout: float = 1.5, target: str = "255.255.255.255") -> list[dict
                 data, addr = sock.recvfrom(4096)
             except socket.timeout:
                 continue
+            except OSError:
+                break
             try:
                 info = json.loads(data.decode("utf-8", "replace"))
             except ValueError:
                 continue
-            info.setdefault("ip", addr[0])
+            if info.get("ip") in (None, "", "0.0.0.0"):
+                info["ip"] = addr[0]
             found[info.get("mac", addr[0])] = info
+    except OSError:
+        pass
     finally:
         sock.close()
     return list(found.values())
 
 
-def resolve_host(host: Optional[str], quiet: bool = False) -> str:
+def _reachable(host: str, timeout: float = 0.6) -> bool:
+    try:
+        with socket.create_connection((host, 80), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def resolve_host(host: Optional[str], log: Callable[[str], None] = lambda m: None) -> str:
     if host:
         return host
+    env = os.environ.get("BRIDGE_HOST")
+    if env:
+        return env
     try:
-        ip = socket.gethostbyname(DEFAULT_HOSTNAME)
-        if not quiet:
-            print(f"# using {DEFAULT_HOSTNAME} -> {ip}", file=sys.stderr)
-        return ip
+        cached = CACHE_FILE.read_text().strip()
+        if cached and _reachable(cached):
+            return cached
     except OSError:
         pass
-    bridges = discover()
-    if not bridges:
-        raise SystemExit("no bridge found (mDNS and UDP discovery failed); pass --host")
-    if len(bridges) > 1 and not quiet:
-        print("# several bridges found, using the first:", file=sys.stderr)
-    ip = bridges[0]["ip"]
-    if not quiet:
-        print(f"# discovered {bridges[0].get('name', '?')} at {ip}", file=sys.stderr)
-    return ip
+    try:
+        ip = socket.gethostbyname(MDNS_NAME)
+        if _reachable(ip):
+            log(f"{MDNS_NAME} -> {ip}")
+            return ip
+    except OSError:
+        pass
+    bridges = discover(1.2)
+    if bridges:
+        log(f"discovered {bridges[0].get('name', '?')} at {bridges[0]['ip']}")
+        return bridges[0]["ip"]
+    if _reachable(SETUP_AP_IP, 1.0):
+        log(f"using the setup AP at {SETUP_AP_IP}")
+        return SETUP_AP_IP
+    raise BridgeError("no bridge found (tried $BRIDGE_HOST, cache, mDNS, UDP discovery, "
+                      "setup AP 192.168.4.1); pass --host or connect to the DreameBridge-XXXX Wi-Fi")
 
 
-# --------------------------------------------------------------------------- UART link
+def remember_host(host: str) -> None:
+    try:
+        CACHE_FILE.write_text(host)
+    except OSError:
+        pass
 
-class UartLink:
-    """Raw TCP connection to the bridge's UART port with a reader thread."""
 
-    def __init__(self, host: str, port: int = DEFAULT_UART_PORT,
-                 on_data: Optional[Callable[[bytes], None]] = None,
-                 on_close: Optional[Callable[[str], None]] = None):
-        self.sock = socket.create_connection((host, port), timeout=5)
-        self.sock.settimeout(None)
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.on_data = on_data
-        self.on_close = on_close
-        self.closed = False
-        self.rx_queue: "queue.Queue[bytes]" = queue.Queue()
-        self._thread = threading.Thread(target=self._reader, daemon=True)
-        self._thread.start()
+# --------------------------------------------------------------------------- transports
 
-    def _reader(self) -> None:
-        reason = "closed by bridge"
+class HttpTransport:
+    def __init__(self, host: str):
+        self.host = host
+
+    def run(self, line: str, timeout: float = CMD_TIMEOUT) -> dict:
+        req = urllib.request.Request(
+            f"http://{self.host}/api/cmd", data=line.encode("utf-8"), method="POST",
+            headers={"X-Bridge": "1", "Content-Type": "text/plain"})
         try:
-            while True:
-                data = self.sock.recv(4096)
-                if not data:
-                    break
-                if self.on_data:
-                    self.on_data(data)
-                else:
-                    self.rx_queue.put(data)
-        except OSError as exc:
-            reason = str(exc)
-        if not self.closed:
-            self.closed = True
-            if self.on_close:
-                self.on_close(reason)
-
-    def send(self, data: bytes) -> None:
-        self.sock.sendall(data)
-
-    def read_for(self, seconds: float) -> bytes:
-        """Collect whatever arrives within `seconds` (only without on_data)."""
-        out = bytearray()
-        deadline = time.monotonic() + seconds
-        while True:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                break
-            try:
-                out += self.rx_queue.get(timeout=left)
-            except queue.Empty:
-                break
-        return bytes(out)
-
-    def close(self) -> None:
-        self.closed = True
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            if not body.startswith(b"{"):
+                raise BridgeError(f"HTTP {exc.code}: {body.decode(errors='replace')}")
+        except (urllib.error.URLError, OSError) as exc:
+            raise BridgeError(f"{self.host}: {getattr(exc, 'reason', exc)}")
         try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
+            return json.loads(body)
+        except ValueError:
+            raise BridgeError(f"bad reply: {body[:200]!r}")
+
+
+class UsbTransport:
+    """Same commands over the USB CDC console: "@CMD <line>" -> "@CMD <json>"."""
+
+    def __init__(self, port: str):
+        try:
+            import serial  # type: ignore
+        except ImportError:
+            raise BridgeError("--usb needs pyserial: pip install pyserial")
+        # ESP32-S2 (ROM USB CDC, 303A:0002) only transmits with DTR=0, RTS=1,
+        # and closing the port (RTS falling) reboots it; settings are kept.
+        # ESP32-S3 (USB-Serial-JTAG, 303A:1001) resets while RTS is asserted,
+        # so both lines stay low there.
+        is_s3 = False
+        try:
+            from serial.tools import list_ports  # type: ignore
+            for info in list_ports.comports():
+                if info.device == port and info.vid == 0x303A and info.pid == 0x1001:
+                    is_s3 = True
+        except Exception:
             pass
-        self.sock.close()
+        self.ser = serial.Serial()
+        self.ser.port = port
+        self.ser.baudrate = 115200
+        self.ser.timeout = 0.2
+        self.ser.dtr = False
+        self.ser.rts = not is_s3
+        self.ser.open()
+        time.sleep(0.3)
+        self.ser.reset_input_buffer()
+
+    def run(self, line: str, timeout: float = CMD_TIMEOUT) -> dict:
+        self.ser.write(b"@CMD " + line.encode("utf-8") + b"\n")
+        deadline = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < deadline:
+            buf += self.ser.read(4096)
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                raw = raw.strip()
+                if raw.startswith(b"@CMD "):
+                    return json.loads(raw[5:])
+        raise BridgeError("no reply on USB (is this the bridge's port?)")
 
 
-# --------------------------------------------------------------------------- SWD text API
-
-class SwdClient:
-    """Line protocol on tcp/2325. Several commands share one connection."""
-
-    def __init__(self, host: str, port: int = DEFAULT_SWD_PORT, timeout: float = 10):
-        self.sock = socket.create_connection((host, port), timeout=timeout)
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.buf = b""
-
-    def _read_line(self) -> str:
-        while b"\n" not in self.buf:
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("SWD connection closed")
-            self.buf += chunk
-        line, self.buf = self.buf.split(b"\n", 1)
-        return line.decode("utf-8", "replace").rstrip("\r")
-
-    def _read_exact(self, n: int) -> bytes:
-        while len(self.buf) < n:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise ConnectionError("SWD connection closed mid-transfer")
-            self.buf += chunk
-        data, self.buf = self.buf[:n], self.buf[n:]
-        return data
-
-    def command(self, line: str) -> tuple[str, Optional[bytes]]:
-        """Returns (status line, binary body for READ/DUMP)."""
-        verb = line.split()[0].upper() if line.split() else ""
-        if verb in ("WRITE", "MWRITE"):
-            raise ValueError(f"{verb} needs a binary payload; not supported from this tool")
-        self.sock.sendall(line.encode() + b"\n")
-        status = self._read_line()
-        if verb in ("READ", "DUMP") and status.startswith("OK "):
-            try:
-                length = int(status.split()[1])
-            except (IndexError, ValueError):
-                return status, None
-            return status, self._read_exact(length)
-        return status, None
-
-    def close(self) -> None:
-        self.sock.close()
+def make_transport(args) -> HttpTransport | UsbTransport:
+    if getattr(args, "usb", None):
+        return UsbTransport(args.usb)
+    host = resolve_host(args.host, lambda m: print(f"# {m}", file=sys.stderr) if args.verbose else None)
+    return HttpTransport(host)
 
 
-# --------------------------------------------------------------------------- CLI commands
+# --------------------------------------------------------------------------- output
+
+def print_result(res: dict, args) -> int:
+    if args.text and "text" in res:
+        text = res["text"]
+        sys.stdout.write(text)
+        if text and not text.endswith("\n"):
+            sys.stdout.write("\n")
+    elif args.pretty:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(res, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
+
+
+# --------------------------------------------------------------------------- local commands
 
 def cmd_discover(args) -> int:
     bridges = discover(args.timeout)
-    if args.json:
-        print(json.dumps(bridges, indent=2))
-        return 0 if bridges else 1
-    if not bridges:
-        print("no bridge answered on UDP", DISCOVERY_PORT)
-        return 1
-    for b in bridges:
-        st = b.get("uart_stats", {})
-        print(f"{b.get('name', '?'):16} {b.get('ip', '?'):15} {b.get('mac', '?')}  "
-              f"uart tcp/{b.get('uart_port')} {b.get('uart_baud')} {b.get('uart_mode')}  "
-              f"swd tcp/{b.get('swd_port')}  rx={st.get('rx_bytes')} tx={st.get('tx_bytes')}")
-    return 0
-
-
-def cmd_status(args) -> int:
-    host = resolve_host(args.host, quiet=True)
-    replies = discover(args.timeout, target=host)
-    if not replies:
-        print(f"{host}: no reply on UDP {DISCOVERY_PORT}")
-        return 1
-    print(json.dumps(replies[0], indent=2))
-    st = replies[0].get("uart_stats", {})
-    if st.get("frame_err", 0) or st.get("parity_err", 0):
-        print("# frame/parity errors: check baud rate and parity", file=sys.stderr)
-    if st.get("fifo_ovf", 0) or st.get("buf_full", 0):
-        print("# overflow: robot sends faster than the bridge forwards", file=sys.stderr)
-    return 0
-
-
-def cmd_send(args) -> int:
-    host = resolve_host(args.host)
-    payload = parse_hex(args.data) if args.hex else unescape(args.data) + EOLS[args.eol]
-    link = UartLink(host, args.port)
-    try:
-        link.send(payload)
-        reply = link.read_for(args.wait)
-    finally:
-        link.close()
-    if args.hex_out:
-        print(hexdump(reply))
-    else:
-        sys.stdout.write(reply.decode("utf-8", "replace"))
-        if reply and not reply.endswith(b"\n"):
-            print()
-    return 0
+    print(json.dumps({"ok": bool(bridges), "bridges": bridges}, indent=2 if args.pretty else None))
+    return 0 if bridges else 1
 
 
 def cmd_term(args) -> int:
     host = resolve_host(args.host)
+    sock = socket.create_connection((host, args.port), timeout=5)
+    sock.settimeout(None)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    eol = {"none": b"", "lf": b"\n", "cr": b"\r", "crlf": b"\r\n"}[args.eol]
     log = open(args.log, "ab") if args.log else None
-    out = sys.stdout
+    stop = threading.Event()
 
-    def on_data(data: bytes) -> None:
-        if log:
-            log.write(data)
-            log.flush()
-        if args.hex_out:
-            out.write(hexdump(data) + "\n")
-        else:
-            out.write(data.decode("utf-8", "replace"))
-        out.flush()
+    def reader():
+        try:
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                if log:
+                    log.write(data)
+                    log.flush()
+                sys.stdout.write(data.hex(" ") + "\n" if args.hex_out else data.decode("utf-8", "replace"))
+                sys.stdout.flush()
+        except OSError:
+            pass
+        stop.set()
+        print("\n# disconnected", file=sys.stderr)
 
-    def on_close(reason: str) -> None:
-        out.write(f"\n# disconnected: {reason}\n")
-        out.flush()
-
-    link = UartLink(host, args.port, on_data, on_close)
-    print(f"# connected to {host}:{args.port}  (eol={args.eol}; "
-          f"lines starting with ':hex ' are sent as hex; Ctrl+C or ':q' quits)",
+    threading.Thread(target=reader, daemon=True).start()
+    print(f"# {host}:{args.port} raw terminal (eol={args.eol}; ':hex 41 42' sends hex; ':q' quits)",
           file=sys.stderr)
     try:
         for line in sys.stdin:
-            if link.closed:
+            if stop.is_set():
                 break
             line = line.rstrip("\r\n")
             if line == ":q":
                 break
             if line.startswith(":hex "):
-                data = parse_hex(line[5:])
+                digits = "".join(c for c in line[5:].replace("0x", "") if c in "0123456789abcdefABCDEF")
+                sock.sendall(bytes.fromhex(digits))
             else:
-                data = unescape(line) + EOLS[args.eol]
-            if log:
-                log.write(b"\n>>> " + data + b"\n")
-            link.send(data)
+                sock.sendall(line.encode("utf-8").decode("unicode_escape").encode("latin-1") + eol)
     except KeyboardInterrupt:
         pass
     finally:
-        link.close()
+        sock.close()
         if log:
             log.close()
     return 0
 
 
-def cmd_swd(args) -> int:
+def cmd_app(args) -> int:
+    import webbrowser
     host = resolve_host(args.host)
-    client = SwdClient(host, args.port)
-    rc = 0
-    try:
-        for line in args.commands:
-            status, body = client.command(line)
-            print(f"> {line}\n{status}")
-            if not status.startswith("OK"):
-                rc = 1
-            if body is not None:
-                if args.out:
-                    with open(args.out, "wb") as f:
-                        f.write(body)
-                    print(f"# {len(body)} bytes -> {args.out}")
-                else:
-                    base = 0
-                    parts = line.split()
-                    if len(parts) > 1:
-                        try:
-                            base = int(parts[1], 0)
-                        except ValueError:
-                            pass
-                    print(hexdump(body, base))
-    finally:
-        client.close()
-    return rc
+    url = f"http://{host}/"
+    print(url)
+    webbrowser.open(url)
+    return 0
 
 
-# --------------------------------------------------------------------------- GUI
+# --------------------------------------------------------------------------- MCP server
 
-def cmd_gui(args) -> int:
-    try:
-        import tkinter as tk
-        from tkinter import filedialog, messagebox, ttk
-    except ImportError:
-        raise SystemExit("tkinter is not available in this Python installation")
+MCP_TOOLS = [
+    {
+        "name": "bridge_command",
+        "description": (
+            "Run one command on the Dreame robot bridge (ESP32-S2, Wi-Fi <-> robot UART/SWD) and "
+            "return its JSON reply. Same language as the web app and the bridge_tool.py CLI. "
+            "Commands: help | status | wifi.scan | wifi.set <ssid> <password> | wifi.forget | "
+            "wifi.ap on|off | uart.baud [rate] | uart.send <data> | uart.sendhex <hex> | "
+            "uart.read [wait_ms] | uart.xfer <wait_ms> <data> | swd <cmd> (PING ID DPID PID CTRL "
+            "HALT RESUME STEP REGREAD n REGWRITE n v READ addr len ...) | reboot. "
+            "Data escapes: \\r \\n \\t \\0 \\\\ \\\" \\xHH; quote values containing spaces. "
+            "UART replies come back as 'text' (JSON string) and 'hex'."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"command": {"type": "string",
+                                       "description": 'e.g. uart.xfer 800 "info -a\\r\\n"'}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "uart_xfer",
+        "description": ("Send data to the robot UART and return the reply "
+                        "(firmware command: uart.xfer <wait_ms> <data>). The reply ends after 100 ms "
+                        "of silence or wait_ms. Remember the line ending, e.g. 'info -a\\r\\n'."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "data": {"type": "string", "description": "text with escapes \\r \\n \\xHH"},
+                "wait_ms": {"type": "integer", "default": 1000, "minimum": 0, "maximum": 30000},
+            },
+            "required": ["data"],
+        },
+    },
+    {
+        "name": "uart_read",
+        "description": "Return robot UART bytes received since the last read/xfer (firmware: uart.read [wait_ms]).",
+        "inputSchema": {"type": "object",
+                        "properties": {"wait_ms": {"type": "integer", "default": 0, "minimum": 0,
+                                                   "maximum": 30000}}},
+    },
+    {
+        "name": "bridge_status",
+        "description": "Bridge status: Wi-Fi, UART baud and error counters, SWD ports (firmware: status).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "bridge_discover",
+        "description": "Find bridges on the local network via UDP broadcast.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
 
-    root = tk.Tk()
-    root.title("Dreame bridge console")
-    root.geometry("1100x700")
 
-    events: "queue.Queue[tuple[str, object]]" = queue.Queue()
-    state = {"link": None, "last_stats": None, "history": [], "hist_pos": 0}
+def mcp_serve(args) -> int:
+    transport: list = [None]
 
-    # --- top bar
-    top = ttk.Frame(root, padding=6)
-    top.pack(fill="x")
-    ttk.Label(top, text="Host").pack(side="left")
-    host_var = tk.StringVar(value=args.host or "")
-    host_box = ttk.Combobox(top, textvariable=host_var, width=22)
-    host_box.pack(side="left", padx=4)
-    ttk.Label(top, text="UART port").pack(side="left")
-    port_var = tk.StringVar(value=str(args.port))
-    ttk.Entry(top, textvariable=port_var, width=6).pack(side="left", padx=4)
-    btn_scan = ttk.Button(top, text="Scan")
-    btn_scan.pack(side="left", padx=2)
-    btn_conn = ttk.Button(top, text="Connect")
-    btn_conn.pack(side="left", padx=2)
-    conn_label = ttk.Label(top, text="● offline", foreground="#c0392b")
-    conn_label.pack(side="left", padx=10)
-    stats_label = ttk.Label(top, text="")
-    stats_label.pack(side="right")
+    def get_transport():
+        if transport[0] is None:
+            transport[0] = make_transport(args)
+            if isinstance(transport[0], HttpTransport):
+                remember_host(transport[0].host)
+        return transport[0]
 
-    paned = ttk.PanedWindow(root, orient="horizontal")
-    paned.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+    def run_line(line: str) -> dict:
+        return get_transport().run(line)
 
-    # --- terminal
-    left = ttk.Frame(paned)
-    paned.add(left, weight=3)
-    term = tk.Text(left, wrap="char", bg="#0f172a", fg="#e2e8f0", insertbackground="#e2e8f0",
-                   font=("Consolas", 10), state="disabled")
-    term.tag_configure("tx", foreground="#93c5fd")
-    term.tag_configure("sys", foreground="#fbbf24")
-    sb = ttk.Scrollbar(left, command=term.yview)
-    term.configure(yscrollcommand=sb.set)
-    sb.pack(side="right", fill="y")
-    term.pack(fill="both", expand=True)
+    def call_tool(name: str, a: dict) -> dict:
+        if name == "bridge_command":
+            return run_line(str(a.get("command", "")))
+        if name == "uart_xfer":
+            wait = int(a.get("wait_ms", 1000))
+            return run_line(f"uart.xfer {wait} {quote_data(str(a.get('data', '')))}")
+        if name == "uart_read":
+            return run_line(f"uart.read {int(a.get('wait_ms', 0))}")
+        if name == "bridge_status":
+            return run_line("status")
+        if name == "bridge_discover":
+            b = discover(1.5)
+            return {"ok": bool(b), "bridges": b}
+        raise BridgeError(f"unknown tool {name}")
 
-    view_var = tk.StringVar(value="text")
-    echo_var = tk.BooleanVar(value=True)
-    ts_var = tk.BooleanVar(value=False)
-    auto_var = tk.BooleanVar(value=True)
-
-    send_row = ttk.Frame(left, padding=(0, 6, 0, 0))
-    send_row.pack(fill="x")
-    entry = ttk.Entry(send_row)
-    entry.pack(side="left", fill="x", expand=True)
-    eol_var = tk.StringVar(value=args.eol)
-    ttk.Combobox(send_row, textvariable=eol_var, values=list(EOLS), width=6,
-                 state="readonly").pack(side="left", padx=4)
-    hex_in_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(send_row, text="HEX", variable=hex_in_var).pack(side="left")
-    btn_send = ttk.Button(send_row, text="Send")
-    btn_send.pack(side="left", padx=4)
-
-    opt_row = ttk.Frame(left, padding=(0, 4, 0, 0))
-    opt_row.pack(fill="x")
-    ttk.Label(opt_row, text="View").pack(side="left")
-    ttk.Combobox(opt_row, textvariable=view_var, values=["text", "hex"], width=5,
-                 state="readonly").pack(side="left", padx=4)
-    for text, var in (("Echo TX", echo_var), ("Timestamp", ts_var), ("Auto-scroll", auto_var)):
-        ttk.Checkbutton(opt_row, text=text, variable=var).pack(side="left", padx=4)
-    btn_clear = ttk.Button(opt_row, text="Clear")
-    btn_clear.pack(side="right")
-    btn_save = ttk.Button(opt_row, text="Save log")
-    btn_save.pack(side="right", padx=4)
-
-    # --- right side: macros, SWD, stats
-    right = ttk.Frame(paned, padding=(6, 0, 0, 0))
-    paned.add(right, weight=1)
-
-    mac_frame = ttk.LabelFrame(right, text="Macros (name = command, \\r \\n \\xHH ok)", padding=6)
-    mac_frame.pack(fill="x")
-    mac_buttons = ttk.Frame(mac_frame)
-    mac_buttons.pack(fill="x")
-    mac_text = tk.Text(mac_frame, height=6, font=("Consolas", 9))
-    mac_text.insert("1.0", "\n".join(args.macro or ["info = info -a", "version = ver -t", "help = help"]))
-    mac_text.pack(fill="x", pady=(6, 0))
-    btn_mac_apply = ttk.Button(mac_frame, text="Apply macros")
-    btn_mac_apply.pack(anchor="e", pady=(4, 0))
-
-    swd_frame = ttk.LabelFrame(right, text=f"SWD (tcp/{DEFAULT_SWD_PORT})", padding=6)
-    swd_frame.pack(fill="x", pady=6)
-    swd_btns = ttk.Frame(swd_frame)
-    swd_btns.pack(fill="x")
-    swd_entry = ttk.Entry(swd_frame)
-    swd_entry.pack(fill="x", pady=(6, 0))
-    swd_entry.insert(0, "READ 0x08000000 64")
-
-    stat_frame = ttk.LabelFrame(right, text="Bridge status (UDP discovery, 2 s)", padding=6)
-    stat_frame.pack(fill="both", expand=True)
-    stat_text = tk.Text(stat_frame, height=14, font=("Consolas", 9), state="disabled")
-    stat_text.pack(fill="both", expand=True)
-
-    # --- terminal output
-    line_open = {"v": False}
-
-    def term_write(text: str, tag: str = "") -> None:
-        term.configure(state="normal")
-        if ts_var.get() and not line_open["v"]:
-            term.insert("end", time.strftime("%H:%M:%S "), "sys")
-        term.insert("end", text, tag)
-        line_open["v"] = not text.endswith("\n")
-        lines = int(term.index("end-1c").split(".")[0])
-        if lines > 5000:
-            term.delete("1.0", f"{lines - 5000}.0")
-        term.configure(state="disabled")
-        if auto_var.get():
-            term.see("end")
-
-    def sys_msg(text: str) -> None:
-        if line_open["v"]:
-            term_write("\n")
-        term_write(f"# {text}\n", "sys")
-
-    def show_rx(data: bytes) -> None:
-        if view_var.get() == "hex":
-            if line_open["v"]:
-                term_write("\n")
-            term_write(hexdump(data) + "\n")
+    def reply(msg_id, result=None, error=None):
+        out = {"jsonrpc": "2.0", "id": msg_id}
+        if error is not None:
+            out["error"] = error
         else:
-            term_write(data.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n"))
+            out["result"] = result
+        sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
 
-    # --- actions
-    def set_connected(ok: bool) -> None:
-        conn_label.configure(text="● connected" if ok else "● offline",
-                             foreground="#16a34a" if ok else "#c0392b")
-        btn_conn.configure(text="Disconnect" if ok else "Connect")
-
-    def connect_toggle() -> None:
-        link = state["link"]
-        if link:
-            link.close()
-            state["link"] = None
-            set_connected(False)
-            sys_msg("disconnected")
-            return
-        host = host_var.get().strip() or DEFAULT_HOSTNAME
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
         try:
-            port = int(port_var.get())
+            msg = json.loads(raw)
         except ValueError:
-            messagebox.showerror("Port", "invalid port")
-            return
-
-        def worker():
+            reply(None, error={"code": -32700, "message": "parse error"})
+            continue
+        method, msg_id = msg.get("method"), msg.get("id")
+        if msg_id is None:
+            continue  # notification (e.g. notifications/initialized)
+        if method == "initialize":
+            reply(msg_id, {
+                "protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "dreame-bridge", "version": VERSION},
+            })
+        elif method == "ping":
+            reply(msg_id, {})
+        elif method == "tools/list":
+            reply(msg_id, {"tools": MCP_TOOLS})
+        elif method == "tools/call":
+            params = msg.get("params", {})
             try:
-                lk = UartLink(host, port,
-                              on_data=lambda d: events.put(("rx", d)),
-                              on_close=lambda r: events.put(("closed", r)))
-                events.put(("connected", (lk, host, port)))
-            except OSError as exc:
-                events.put(("error", f"connect {host}:{port} failed: {exc}"))
-        sys_msg(f"connecting to {host}:{port} ...")
-        threading.Thread(target=worker, daemon=True).start()
-
-    def send_bytes(data: bytes, label: Optional[str] = None) -> None:
-        link = state["link"]
-        if not link:
-            sys_msg("not connected")
-            return
-        try:
-            link.send(data)
-        except OSError as exc:
-            sys_msg(f"send failed: {exc}")
-            return
-        if echo_var.get():
-            if line_open["v"]:
-                term_write("\n")
-            term_write(f"> {label if label is not None else data.hex(' ')}\n", "tx")
-
-    def send_entry(_event=None) -> None:
-        text = entry.get()
-        try:
-            if hex_in_var.get():
-                send_bytes(parse_hex(text))
-            else:
-                send_bytes(unescape(text) + EOLS[eol_var.get()], text)
-        except ValueError as exc:
-            sys_msg(f"bad input: {exc}")
-            return
-        if text and (not state["history"] or state["history"][-1] != text):
-            state["history"].append(text)
-        state["hist_pos"] = len(state["history"])
-        entry.delete(0, "end")
-
-    def history(step: int) -> str:
-        h = state["history"]
-        if not h:
-            return "break"
-        state["hist_pos"] = max(0, min(len(h), state["hist_pos"] + step))
-        entry.delete(0, "end")
-        if state["hist_pos"] < len(h):
-            entry.insert(0, h[state["hist_pos"]])
-        return "break"
-
-    def apply_macros() -> None:
-        for w in mac_buttons.winfo_children():
-            w.destroy()
-        for i, raw in enumerate(mac_text.get("1.0", "end").splitlines()):
-            if "=" not in raw:
-                continue
-            name, cmd = (p.strip() for p in raw.split("=", 1))
-            if not name:
-                continue
-            b = ttk.Button(mac_buttons, text=name,
-                           command=lambda c=cmd, n=name: send_bytes(unescape(c) + EOLS[eol_var.get()],
-                                                                    f"{n}: {c}"))
-            b.grid(row=i // 3, column=i % 3, sticky="ew", padx=2, pady=2)
-
-    def scan() -> None:
-        def worker():
-            events.put(("scan", discover(1.5)))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def swd_run(line: str) -> None:
-        host = host_var.get().strip() or DEFAULT_HOSTNAME
-
-        def worker():
-            try:
-                c = SwdClient(host)
-                try:
-                    status, body = c.command(line)
-                finally:
-                    c.close()
-                msg = f"SWD> {line}\n{status}"
-                if body is not None:
-                    try:
-                        base = int(line.split()[1], 0)
-                    except (IndexError, ValueError):
-                        base = 0
-                    msg += "\n" + hexdump(body[:1024], base)
-                    if len(body) > 1024:
-                        msg += f"\n... ({len(body)} bytes, use the CLI with --out to save)"
-                events.put(("swd", msg))
-            except (OSError, ValueError, ConnectionError) as exc:
-                events.put(("swd", f"SWD> {line}\nerror: {exc}"))
-        threading.Thread(target=worker, daemon=True).start()
-
-    for i, cmd in enumerate(("PING", "ID", "DPID", "HALT", "RESUME", "STEP")):
-        ttk.Button(swd_btns, text=cmd, command=lambda c=cmd: swd_run(c)).grid(
-            row=i // 3, column=i % 3, sticky="ew", padx=2, pady=2)
-    swd_entry.bind("<Return>", lambda e: swd_run(swd_entry.get().strip()))
-
-    def poll_status() -> None:
-        host = host_var.get().strip()
-
-        def worker():
-            target = host or DEFAULT_HOSTNAME
-            try:
-                target = socket.gethostbyname(target)
-            except OSError:
-                events.put(("stats", None))
-                return
-            r = discover(0.8, target=target)
-            events.put(("stats", r[0] if r else None))
-        threading.Thread(target=worker, daemon=True).start()
-        root.after(2000, poll_status)
-
-    def show_stats(info: Optional[dict]) -> None:
-        stat_text.configure(state="normal")
-        stat_text.delete("1.0", "end")
-        if not info:
-            stat_text.insert("end", "no discovery reply")
-            stats_label.configure(text="")
+                res = call_tool(params.get("name", ""), params.get("arguments") or {})
+                reply(msg_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}],
+                               "isError": not res.get("ok", False)})
+            except (BridgeError, OSError, ValueError) as exc:
+                transport[0] = None  # re-resolve the bridge next time
+                reply(msg_id, {"content": [{"type": "text", "text": f"error: {exc}"}], "isError": True})
         else:
-            st = info.get("uart_stats", {})
-            now = time.monotonic()
-            rate = ""
-            last = state["last_stats"]
-            if last and now > last[0]:
-                dt = now - last[0]
-                rate = (f"↓{(st.get('rx_bytes', 0) - last[1]) / dt:.0f} B/s  "
-                        f"↑{(st.get('tx_bytes', 0) - last[2]) / dt:.0f} B/s")
-            state["last_stats"] = (now, st.get("rx_bytes", 0), st.get("tx_bytes", 0))
-            stats_label.configure(text=f"{info.get('name')} {info.get('ip')}  {rate}")
-            rows = [("name", info.get("name")), ("ip", info.get("ip")), ("mac", info.get("mac")),
-                    ("uart", f"tcp/{info.get('uart_port')} {info.get('uart_baud')} {info.get('uart_mode')}"),
-                    ("gpio tx/rx", f"{info.get('tx_gpio')}/{info.get('rx_gpio')} "
-                                   f"level {info.get('uart_tx_level')}/{info.get('uart_rx_level')}"),
-                    ("swd", f"tcp/{info.get('swd_port')}  bitbang tcp/{info.get('bitbang_port')}")]
-            rows += [(k, v) for k, v in st.items()]
-            for k, v in rows:
-                stat_text.insert("end", f"{k:>12}: {v}\n")
-        stat_text.configure(state="disabled")
-
-    def pump_events() -> None:
-        try:
-            while True:
-                kind, payload = events.get_nowait()
-                if kind == "rx":
-                    show_rx(payload)  # type: ignore[arg-type]
-                elif kind == "connected":
-                    lk, host, port = payload  # type: ignore[misc]
-                    state["link"] = lk
-                    set_connected(True)
-                    sys_msg(f"connected to {host}:{port}")
-                elif kind == "closed":
-                    if state["link"]:
-                        state["link"] = None
-                        set_connected(False)
-                        sys_msg(f"connection lost: {payload}")
-                elif kind == "error":
-                    sys_msg(str(payload))
-                elif kind == "scan":
-                    found = payload or []
-                    host_box.configure(values=[b["ip"] for b in found])  # type: ignore[index]
-                    if found and not host_var.get():
-                        host_var.set(found[0]["ip"])  # type: ignore[index]
-                    sys_msg(f"scan: {len(found)} bridge(s) " +  # type: ignore[arg-type]
-                            ", ".join(f"{b.get('name')}@{b.get('ip')}" for b in found))  # type: ignore[union-attr]
-                elif kind == "swd":
-                    sys_msg(str(payload).replace("\n", "\n# "))
-                elif kind == "stats":
-                    show_stats(payload)  # type: ignore[arg-type]
-        except queue.Empty:
-            pass
-        root.after(30, pump_events)
-
-    def save_log() -> None:
-        path = filedialog.asksaveasfilename(defaultextension=".txt")
-        if path:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(term.get("1.0", "end"))
-
-    def clear() -> None:
-        term.configure(state="normal")
-        term.delete("1.0", "end")
-        term.configure(state="disabled")
-        line_open["v"] = False
-
-    btn_conn.configure(command=connect_toggle)
-    btn_scan.configure(command=scan)
-    btn_send.configure(command=send_entry)
-    btn_mac_apply.configure(command=apply_macros)
-    btn_clear.configure(command=clear)
-    btn_save.configure(command=save_log)
-    entry.bind("<Return>", send_entry)
-    entry.bind("<Up>", lambda e: history(-1))
-    entry.bind("<Down>", lambda e: history(1))
-
-    apply_macros()
-    pump_events()
-    poll_status()
-    if not args.host:
-        scan()
-    entry.focus_set()
-    root.mainloop()
-    if state["link"]:
-        state["link"].close()
+            reply(msg_id, error={"code": -32601, "message": f"method not found: {method}"})
     return 0
 
 
 # --------------------------------------------------------------------------- main
 
+LOCAL = {"discover", "term", "app", "mcp"}
+
+
 def main(argv: Optional[list[str]] = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = p.add_subparsers(dest="cmd", required=True)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    p = argparse.ArgumentParser(
+        prog="bridge_tool.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--host", help="bridge IP or hostname")
+    p.add_argument("--usb", metavar="PORT", help="use the USB cable (e.g. COM8, /dev/ttyACM0)")
+    p.add_argument("--pretty", action="store_true", help="indent JSON output")
+    p.add_argument("--text", action="store_true", help="print only the UART 'text' of the reply")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--timeout", type=float, default=1.5, help="discover: seconds to wait")
+    p.add_argument("--port", type=int, default=UART_PORT, help="term: raw UART TCP port")
+    p.add_argument("--eol", choices=["none", "lf", "cr", "crlf"], default="crlf", help="term: line ending")
+    p.add_argument("--hex-out", action="store_true", help="term: show received bytes as hex")
+    p.add_argument("--log", help="term: append received bytes to this file")
+    p.add_argument("command", nargs=argparse.REMAINDER,
+                   help="a firmware command (see 'help') or discover/term/app/mcp")
 
-    def add_host(sp, port_default):
-        sp.add_argument("--host", help=f"bridge IP/hostname (default: {DEFAULT_HOSTNAME} or discovery)")
-        sp.add_argument("--port", type=int, default=port_default)
-
-    sp = sub.add_parser("discover", help="find bridges via UDP broadcast")
-    sp.add_argument("--timeout", type=float, default=1.5)
-    sp.add_argument("--json", action="store_true")
-    sp.set_defaults(func=cmd_discover)
-
-    sp = sub.add_parser("status", help="show discovery JSON (UART counters) of one bridge")
-    sp.add_argument("--host")
-    sp.add_argument("--timeout", type=float, default=1.5)
-    sp.set_defaults(func=cmd_status)
-
-    sp = sub.add_parser("term", help="interactive raw UART terminal")
-    add_host(sp, DEFAULT_UART_PORT)
-    sp.add_argument("--eol", choices=list(EOLS), default="crlf")
-    sp.add_argument("--hex-out", action="store_true", help="show received bytes as hex dump")
-    sp.add_argument("--log", help="append everything received to this file")
-    sp.set_defaults(func=cmd_term)
-
-    sp = sub.add_parser("send", help="send one command and print the reply")
-    add_host(sp, DEFAULT_UART_PORT)
-    sp.add_argument("data")
-    sp.add_argument("--hex", action="store_true", help="data is hex bytes, no EOL added")
-    sp.add_argument("--eol", choices=list(EOLS), default="crlf")
-    sp.add_argument("--wait", type=float, default=1.0, help="seconds to collect the reply")
-    sp.add_argument("--hex-out", action="store_true")
-    sp.set_defaults(func=cmd_send)
-
-    sp = sub.add_parser("swd", help="run SWD text commands over one connection")
-    add_host(sp, DEFAULT_SWD_PORT)
-    sp.add_argument("commands", nargs="+", help='e.g. PING ID "READ 0x08000000 256"')
-    sp.add_argument("--out", help="write the READ/DUMP body to this file")
-    sp.set_defaults(func=cmd_swd)
-
-    sp = sub.add_parser("gui", help="graphical console")
-    add_host(sp, DEFAULT_UART_PORT)
-    sp.add_argument("--eol", choices=list(EOLS), default="crlf")
-    sp.add_argument("--macro", action="append", help='"name = command", repeatable')
-    sp.set_defaults(func=cmd_gui)
-
+    # Options must come before the command; everything after it belongs to the command.
     args = p.parse_args(argv)
-    return args.func(args)
+    if not args.command:
+        p.print_help()
+        return 2
+    name = args.command[0]
+
+    try:
+        if name == "discover":
+            return cmd_discover(args)
+        if name == "term":
+            return cmd_term(args)
+        if name == "app":
+            return cmd_app(args)
+        if name == "mcp":
+            return mcp_serve(args)
+        line = build_line(args.command)
+        transport = make_transport(args)
+        res = transport.run(line)
+        if isinstance(transport, HttpTransport):
+            remember_host(transport.host)
+        return print_result(res, args)
+    except BridgeError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 1
 
 
 if __name__ == "__main__":

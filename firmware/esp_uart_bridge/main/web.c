@@ -1,0 +1,331 @@
+/* Web app + HTTP command API + WebSocket terminal on port 80.
+ *
+ *   GET  /          the app (main/web/index.html, embedded)
+ *   POST /api/cmd   body: one command line -> one JSON reply (see cmd.c)
+ *                   Requires an "X-Bridge" header: browsers cannot add it
+ *                   cross-site without a CORS preflight, which is never
+ *                   granted, so other web pages cannot drive the robot.
+ *   GET  /ws        WebSocket: robot UART bytes out (binary), bytes in -> UART
+ *
+ * Commands run on their own worker task so a long uart.xfer or wifi.set does
+ * not freeze the terminal stream.
+ */
+
+#include "web.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "lwip/sockets.h"
+
+#include "cmd.h"
+#include "uart_tcp_bridge.h"
+
+#if !CONFIG_HTTPD_WS_SUPPORT
+#error "CONFIG_HTTPD_WS_SUPPORT is required (see sdkconfig.defaults)"
+#endif
+
+static const char *TAG = "web";
+
+#define MAX_BODY        1024
+#define MAX_WS          3
+#define WS_MAX_QUEUED   (16 * 1024)   /* stalled browsers lose data beyond this */
+#define CMD_QUEUE_LEN   4
+
+extern const char index_html_start[] asm("_binary_index_html_start");
+extern const char index_html_end[] asm("_binary_index_html_end");
+
+static httpd_handle_t s_server;
+static int s_ws_fds[MAX_WS] = { -1, -1, -1 };
+static portMUX_TYPE s_ws_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile int s_ws_count;
+static volatile int s_ws_queued;
+
+typedef struct {
+    httpd_req_t *req;
+    char line[];
+} cmd_job_t;
+
+static QueueHandle_t s_cmd_queue;
+
+/* ------------------------------------------------------------ static app */
+
+static esp_err_t index_get(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return httpd_resp_send(req, index_html_start, index_html_end - index_html_start);
+}
+
+/* ------------------------------------------------------------ command API */
+
+static void cmd_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        cmd_job_t *job;
+        if (xQueueReceive(s_cmd_queue, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        char *json = cmd_exec(job->line);
+        httpd_resp_set_type(job->req, "application/json");
+        httpd_resp_set_hdr(job->req, "Cache-Control", "no-store");
+        httpd_resp_sendstr(job->req, json);
+        free(json);
+        httpd_req_async_handler_complete(job->req);
+        free(job);
+    }
+}
+
+static esp_err_t api_cmd_post(httpd_req_t *req)
+{
+    if (httpd_req_get_hdr_value_len(req, "X-Bridge") == 0) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "missing X-Bridge header");
+        return ESP_OK;
+    }
+    if (req->content_len == 0 || req->content_len > MAX_BODY) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body: one command line, max 1024 bytes");
+        return ESP_OK;
+    }
+
+    cmd_job_t *job = malloc(sizeof(*job) + req->content_len + 1);
+    if (job == NULL) {
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    size_t got = 0;
+    while (got < req->content_len) {
+        int n = httpd_req_recv(req, job->line + got, req->content_len - got);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (n <= 0) {
+            free(job);
+            return ESP_FAIL;
+        }
+        got += (size_t)n;
+    }
+    job->line[got] = '\0';
+    job->line[strcspn(job->line, "\r\n")] = '\0';
+
+    if (httpd_req_async_handler_begin(req, &job->req) != ESP_OK) {
+        free(job);
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    if (xQueueSend(s_cmd_queue, &job, 0) != pdTRUE) {
+        httpd_resp_set_status(job->req, "503 Service Unavailable");
+        httpd_resp_sendstr(job->req, "{\"ok\":false,\"error\":\"busy: too many queued commands\"}");
+        httpd_req_async_handler_complete(job->req);
+        free(job);
+    }
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------ WebSocket */
+
+static void ws_remove(int fd)
+{
+    portENTER_CRITICAL(&s_ws_mux);
+    for (int i = 0; i < MAX_WS; i++) {
+        if (s_ws_fds[i] == fd) {
+            s_ws_fds[i] = -1;
+            s_ws_count--;
+        }
+    }
+    portEXIT_CRITICAL(&s_ws_mux);
+}
+
+static bool ws_add(int fd)
+{
+    bool added = false;
+    portENTER_CRITICAL(&s_ws_mux);
+    for (int i = 0; i < MAX_WS && !added; i++) {
+        if (s_ws_fds[i] < 0) {
+            s_ws_fds[i] = fd;
+            s_ws_count++;
+            added = true;
+        }
+    }
+    portEXIT_CRITICAL(&s_ws_mux);
+    return added;
+}
+
+/* Rejects cross-site WebSocket connections (a foreign page in the user's
+ * browser opening ws://dreame-bridge.local/ws). */
+static bool same_origin(httpd_req_t *req)
+{
+    char origin[96];
+    char host[64];
+    if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) != ESP_OK) {
+        return true;   /* not a browser: CLI tools, scripts */
+    }
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+        return false;
+    }
+    const char *o = strstr(origin, "://");
+    return o != NULL && strcmp(o + 3, host) == 0;
+}
+
+/* ESP-IDF >= 6 answers the handshake itself and reports it through these
+ * callbacks; older versions call ws_handler() with HTTP_GET instead. */
+static esp_err_t ws_pre_handshake(httpd_req_t *req)
+{
+    if (!same_origin(req)) {
+        ESP_LOGW(TAG, "ws: cross-origin handshake refused");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t ws_post_handshake(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    if (!ws_add(fd)) {
+        ESP_LOGW(TAG, "ws: too many terminals, fd %d refused", fd);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "ws: client fd %d", fd);
+    return ESP_OK;
+}
+
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        return ws_pre_handshake(req) == ESP_OK ? ws_post_handshake(req) : ESP_FAIL;
+    }
+
+    httpd_ws_frame_t frame = { 0 };
+    esp_err_t err = httpd_ws_recv_frame(req, &frame, 0);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (frame.len == 0 || frame.len > MAX_BODY) {
+        return frame.len == 0 ? ESP_OK : ESP_FAIL;
+    }
+    uint8_t *buf = malloc(frame.len);
+    if (buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    frame.payload = buf;
+    err = httpd_ws_recv_frame(req, &frame, frame.len);
+    if (err == ESP_OK &&
+        (frame.type == HTTPD_WS_TYPE_TEXT || frame.type == HTTPD_WS_TYPE_BINARY)) {
+        uart_tcp_bridge_write(buf, frame.len);
+    }
+    free(buf);
+    return err;
+}
+
+typedef struct {
+    size_t len;
+    uint8_t data[];
+} ws_msg_t;
+
+static void ws_send_work(void *arg)
+{
+    ws_msg_t *m = arg;
+    int fds[MAX_WS];
+    portENTER_CRITICAL(&s_ws_mux);
+    memcpy(fds, s_ws_fds, sizeof(fds));
+    portEXIT_CRITICAL(&s_ws_mux);
+
+    httpd_ws_frame_t frame = {
+        .type = HTTPD_WS_TYPE_BINARY,
+        .payload = m->data,
+        .len = m->len,
+        .final = true,
+    };
+    for (int i = 0; i < MAX_WS; i++) {
+        if (fds[i] < 0) {
+            continue;
+        }
+        if (httpd_ws_get_fd_info(s_server, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) {
+            ws_remove(fds[i]);
+            continue;
+        }
+        if (httpd_ws_send_frame_async(s_server, fds[i], &frame) != ESP_OK) {
+            ws_remove(fds[i]);
+            httpd_sess_trigger_close(s_server, fds[i]);
+        }
+    }
+    __atomic_fetch_sub(&s_ws_queued, (int)m->len, __ATOMIC_RELAXED);
+    free(m);
+}
+
+/* UART reader task -> httpd task. Copies, so the reader never waits on a browser. */
+static void ws_tap(const uint8_t *data, size_t len)
+{
+    if (s_ws_count == 0 || s_ws_queued + (int)len > WS_MAX_QUEUED) {
+        return;
+    }
+    ws_msg_t *m = malloc(sizeof(*m) + len);
+    if (m == NULL) {
+        return;
+    }
+    m->len = len;
+    memcpy(m->data, data, len);
+    __atomic_fetch_add(&s_ws_queued, (int)len, __ATOMIC_RELAXED);
+    if (httpd_queue_work(s_server, ws_send_work, m) != ESP_OK) {
+        __atomic_fetch_sub(&s_ws_queued, (int)len, __ATOMIC_RELAXED);
+        free(m);
+    }
+}
+
+static void on_close(httpd_handle_t hd, int fd)
+{
+    (void)hd;
+    ws_remove(fd);
+    close(fd);
+}
+
+/* ------------------------------------------------------------ start */
+
+void web_start(void)
+{
+    s_cmd_queue = xQueueCreate(CMD_QUEUE_LEN, sizeof(cmd_job_t *));
+    assert(s_cmd_queue != NULL);
+    xTaskCreate(cmd_worker, "cmd_worker", 6144, NULL, 4, NULL);
+
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.max_open_sockets = 6;
+    cfg.lru_purge_enable = true;
+    cfg.max_uri_handlers = 4;
+    cfg.stack_size = 4608;   /* handlers only parse and queue; commands run in cmd_worker */
+    cfg.close_fn = on_close;
+    cfg.keep_alive_enable = true;
+    cfg.keep_alive_idle = 5;
+    cfg.keep_alive_interval = 2;
+    cfg.keep_alive_count = 3;
+
+    esp_err_t err = httpd_start(&s_server, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start: %s", esp_err_to_name(err));
+        return;
+    }
+
+    static const httpd_uri_t index_uri = { .uri = "/", .method = HTTP_GET, .handler = index_get };
+    static const httpd_uri_t cmd_uri = { .uri = "/api/cmd", .method = HTTP_POST,
+                                         .handler = api_cmd_post };
+    static const httpd_uri_t ws_uri = {
+        .uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true,
+#if CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+        .ws_pre_handshake_cb = ws_pre_handshake,
+#endif
+#if CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+        .ws_post_handshake_cb = ws_post_handshake,
+#endif
+    };
+    httpd_register_uri_handler(s_server, &index_uri);
+    httpd_register_uri_handler(s_server, &cmd_uri);
+    httpd_register_uri_handler(s_server, &ws_uri);
+
+    uart_tcp_bridge_add_tap(ws_tap);
+    ESP_LOGI(TAG, "app: http://%s.local/  (setup AP: http://192.168.4.1/)", CONFIG_BRIDGE_HOSTNAME);
+}

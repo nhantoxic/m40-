@@ -25,6 +25,8 @@
 #include "lwip/sockets.h"
 #include "soc/gpio_reg.h"
 
+#include "bridge_cores.h"
+#include "cmd.h"
 #include "swd_bridge.h"
 
 static const char *TAG = "swd";
@@ -74,6 +76,8 @@ static SemaphoreHandle_t s_swd_lock;
 static uint32_t s_half_period_cycles;
 static volatile unsigned s_last_ack;
 static volatile bool s_swdio_output;
+/* OpenOCD holds s_swd_lock for its whole session. */
+static volatile bool s_bitbang_active;
 
 /* Direct-register bit-bang -> SWD clock far above gpio_set_level(). SWDIO and
  * SWCLK are <32 on the S2-mini wiring, so the GPIO0..31 register bank applies. */
@@ -1096,15 +1100,86 @@ static void configure_client_socket(int sock, int rcv_timeout_s)
     }
 }
 
-static int recv_line(int sock, char *line, size_t capacity)
+/* Transport for handle_command(): either a TCP client (buffered reads, so a
+ * command line costs one recv() rather than one per byte) or a single command
+ * line from the app/CLI path whose output is collected in memory. */
+typedef struct {
+    int sock;                 /* -1 for the in-memory transport */
+    uint8_t rbuf[256];
+    size_t rpos;
+    size_t rlen;
+    const char *line;         /* in-memory: the command, consumed once */
+    uint8_t *out;             /* in-memory: collected response */
+    size_t out_len;
+    size_t out_cap;
+    size_t out_max;
+} swd_io_t;
+
+static bool io_send(swd_io_t *io, const void *data, size_t length)
 {
-    size_t used = 0;
-    while (used + 1 < capacity) {
-        char ch;
-        int n = recv(sock, &ch, 1, 0);
-        if (n <= 0) {
+    if (io->sock >= 0) {
+        return send_all(io->sock, data, length);
+    }
+    if (io->out_len + length > io->out_max) {
+        return false;
+    }
+    if (io->out_len + length > io->out_cap) {
+        size_t cap = io->out_cap ? io->out_cap : 128;
+        while (cap < io->out_len + length) {
+            cap *= 2;
+        }
+        uint8_t *p = realloc(io->out, cap);
+        if (p == NULL) {
+            return false;
+        }
+        io->out = p;
+        io->out_cap = cap;
+    }
+    memcpy(io->out + io->out_len, data, length);
+    io->out_len += length;
+    return true;
+}
+
+/* Raw payload bytes (MWRITE/WRITE bodies): drain the line buffer first. */
+static int io_recv(swd_io_t *io, void *buf, size_t length)
+{
+    if (io->sock < 0) {
+        return 0;
+    }
+    if (io->rpos < io->rlen) {
+        size_t n = io->rlen - io->rpos;
+        if (n > length) {
+            n = length;
+        }
+        memcpy(buf, io->rbuf + io->rpos, n);
+        io->rpos += n;
+        return (int)n;
+    }
+    return recv(io->sock, buf, length, 0);
+}
+
+static int io_recv_line(swd_io_t *io, char *line, size_t capacity)
+{
+    if (io->sock < 0) {
+        if (io->line == NULL) {
             return -1;
         }
+        strlcpy(line, io->line, capacity);
+        io->line = NULL;
+        return (int)strlen(line);
+    }
+
+    size_t used = 0;
+    while (used + 1 < capacity) {
+        if (io->rpos >= io->rlen) {
+            int n = recv(io->sock, io->rbuf, sizeof(io->rbuf), 0);
+            if (n <= 0) {
+                return -1;
+            }
+            io->rpos = 0;
+            io->rlen = (size_t)n;
+        }
+        char ch = (char)io->rbuf[io->rpos++];
         if (ch == '\n') {
             line[used] = '\0';
             return (int)used;
@@ -1120,10 +1195,10 @@ static int recv_line(int sock, char *line, size_t capacity)
 /* Handles one command. Returns false when the connection must be closed:
  * the peer is gone, or a binary transfer was cut short so the byte stream no
  * longer lines up with the command framing. */
-static bool handle_command(int sock)
+static bool handle_command(swd_io_t *io)
 {
     char line[SWD_MAX_LINE];
-    int line_len = recv_line(sock, line, sizeof(line));
+    int line_len = io_recv_line(io, line, sizeof(line));
     if (line_len < 0) {
         return false;
     }
@@ -1135,12 +1210,12 @@ static bool handle_command(int sock)
         char response[64];
         int n = snprintf(response, sizeof(response), "OK RAW=0x%02lX\n",
                          (unsigned long)raw);
-        (void)send_all(sock, response, (size_t)n);
+        (void)io_send(io,  response, (size_t)n);
         return true;
     }
 
     if (strcmp(line, "PING") == 0) {
-        (void)send_all(sock, "PONG PROXY2\n", 12);
+        (void)io_send(io,  "PONG PROXY2\n", 12);
         return true;
     }
 
@@ -1191,7 +1266,7 @@ static bool handle_command(int sock)
                          (unsigned long)before,
                          (unsigned long)after);
         }
-        (void)send_all(sock, response, (size_t)n);
+        (void)io_send(io,  response, (size_t)n);
         return true;
     }
     if (strcmp(line, "DPID") == 0) {
@@ -1212,7 +1287,7 @@ static bool handle_command(int sock)
                          swd_status_name(status), swd_ack_name(s_last_ack),
                          s_last_ack, gpio_get_level(CONFIG_BRIDGE_SWDIO_GPIO));
         }
-        (void)send_all(sock, response, (size_t)n);
+        (void)io_send(io,  response, (size_t)n);
         return true;
     }
 
@@ -1228,13 +1303,13 @@ static bool handle_command(int sock)
                              "OK DPIDR=0x%08lX APIDR=0x%08lX CLK=%lukHz\n",
                              (unsigned long)dp_id, (unsigned long)ap_id,
                              (unsigned long)CONFIG_BRIDGE_SWD_CLOCK_KHZ);
-            (void)send_all(sock, response, (size_t)n);
+            (void)io_send(io,  response, (size_t)n);
         } else {
             int n = snprintf(response, sizeof(response),
                              "ERR SWD %s %s ACK=0x%X DIO=%d\n",
                              swd_status_name(status), swd_ack_name(s_last_ack),
                              s_last_ack, gpio_get_level(CONFIG_BRIDGE_SWDIO_GPIO));
-            (void)send_all(sock, response, (size_t)n);
+            (void)io_send(io,  response, (size_t)n);
         }
         return true;
     }
@@ -1249,13 +1324,13 @@ static bool handle_command(int sock)
         if (status == SWD_OK) {
             int n = snprintf(response, sizeof(response),
                              "OK FMC_PID=0x%08lX\n", (unsigned long)pid);
-            (void)send_all(sock, response, (size_t)n);
+            (void)io_send(io,  response, (size_t)n);
         } else {
             int n = snprintf(response, sizeof(response),
                              "ERR SWD %s %s ACK=0x%X\n",
                              swd_status_name(status), swd_ack_name(s_last_ack),
                              s_last_ack);
-            (void)send_all(sock, response, (size_t)n);
+            (void)io_send(io,  response, (size_t)n);
         }
         return true;
     }
@@ -1264,19 +1339,19 @@ static bool handle_command(int sock)
         char *end = NULL;
         unsigned long address = strtoul(line + 5, &end, 0);
         if (end == line + 5 || *end != ' ') {
-            (void)send_all(sock, "ERR syntax\n", 11);
+            (void)io_send(io,  "ERR syntax\n", 11);
             return true;
         }
         unsigned long length = strtoul(end + 1, &end, 0);
         if (*end != '\0' || length == 0 ||
             length > (unsigned long)CONFIG_BRIDGE_SWD_MAX_READ) {
-            (void)send_all(sock, "ERR range\n", 10);
+            (void)io_send(io,  "ERR range\n", 10);
             return true;
         }
 
         uint8_t *buffer = (uint8_t *)malloc((size_t)length);
         if (buffer == NULL) {
-            (void)send_all(sock, "ERR memory\n", 11);
+            (void)io_send(io,  "ERR memory\n", 11);
             return true;
         }
         xSemaphoreTake(s_swd_lock, portMAX_DELAY);
@@ -1287,15 +1362,15 @@ static bool handle_command(int sock)
             char response[64];
             int n = snprintf(response, sizeof(response), "ERR SWD %s\n",
                              swd_status_name(status));
-            (void)send_all(sock, response, (size_t)n);
+            (void)io_send(io,  response, (size_t)n);
             free(buffer);
             return true;
         }
 
         char header[32];
         int n = snprintf(header, sizeof(header), "OK %lu\n", length);
-        bool ok = send_all(sock, header, (size_t)n) &&
-                  send_all(sock, buffer, (size_t)length);
+        bool ok = io_send(io,  header, (size_t)n) &&
+                  io_send(io,  buffer, (size_t)length);
         if (!ok) {
             ESP_LOGW(TAG, "READ client disconnected while sending data");
         }
@@ -1307,7 +1382,7 @@ static bool handle_command(int sock)
         char *end = NULL;
         unsigned long address = strtoul(line + 5, &end, 0);
         if (end == line + 5 || *end != ' ') {
-            (void)send_all(sock, "ERR syntax\n", 11);
+            (void)io_send(io,  "ERR syntax\n", 11);
             return true;
         }
         unsigned long length = strtoul(end + 1, &end, 0);
@@ -1316,12 +1391,12 @@ static bool handle_command(int sock)
             length > 0x80000UL ||
             !swd_range_contains((uint32_t)address, (size_t)length,
                                 SWD_MEM_FLASH_BASE, SWD_MEM_FLASH_END)) {
-            (void)send_all(sock, "ERR range\n", 10);
+            (void)io_send(io,  "ERR range\n", 10);
             return true;
         }
         char header[32];
         int hn = snprintf(header, sizeof(header), "OK %lu\n", length);
-        if (hn <= 0 || !send_all(sock, header, (size_t)hn)) {
+        if (hn <= 0 || !io_send(io,  header, (size_t)hn)) {
             return false;
         }
         const size_t CH = 4096U;
@@ -1341,7 +1416,7 @@ static bool handle_command(int sock)
             if (st != SWD_OK) {
                 break;
             }
-            if (!send_all(sock, chunk, n)) {
+            if (!io_send(io,  chunk, n)) {
                 break;
             }
             done += n;
@@ -1366,7 +1441,7 @@ static bool handle_command(int sock)
             strtoul(line + 7, &end, 0);
 
         if (end == line + 7 || *end != ' ') {
-            (void)send_all(sock, "ERR syntax\n", 11);
+            (void)io_send(io,  "ERR syntax\n", 11);
             return true;
         }
 
@@ -1379,11 +1454,11 @@ static bool handle_command(int sock)
             !swd_range_contains((uint32_t)address, (size_t)length,
                                 SWD_MEM_SRAM_BASE, SWD_MEM_SRAM_END)) {
 
-            (void)send_all(sock, "ERR range\n", 10);
+            (void)io_send(io,  "ERR range\n", 10);
             return true;
         }
 
-        if (!send_all(sock, "OK\n", 3)) {
+        if (!io_send(io,  "OK\n", 3)) {
             return false;
         }
 
@@ -1391,7 +1466,7 @@ static bool handle_command(int sock)
             (uint8_t *)malloc((size_t)length);
 
         if (payload == NULL) {
-            (void)send_all(sock, "ERR memory\n", 11);
+            (void)io_send(io,  "ERR memory\n", 11);
             return false;
         }
 
@@ -1399,12 +1474,7 @@ static bool handle_command(int sock)
 
         while (got < (size_t)length) {
 
-            int n = recv(
-                sock,
-                payload + got,
-                (size_t)length - got,
-                0
-            );
+            int n = io_recv(io, payload + got, (size_t)length - got);
 
             if (n <= 0) {
                 free(payload);
@@ -1447,7 +1517,7 @@ static bool handle_command(int sock)
             );
         }
 
-        (void)send_all(sock,response,(size_t)n);
+        (void)io_send(io, response,(size_t)n);
         return true;
     }
 
@@ -1483,7 +1553,7 @@ static bool handle_command(int sock)
             );
         }
 
-        (void)send_all(sock,response,(size_t)n);
+        (void)io_send(io, response,(size_t)n);
         return true;
     }
 
@@ -1527,7 +1597,7 @@ static bool handle_command(int sock)
             );
         }
 
-        (void)send_all(sock, response, (size_t)n);
+        (void)io_send(io,  response, (size_t)n);
         return true;
     }
 
@@ -1541,7 +1611,7 @@ static bool handle_command(int sock)
         if (sscanf(line + 9, "%lu %lx %lx %lx",
                    &max_steps, &stop0, &stop1, &stop2) != 4 ||
             max_steps == 0 || max_steps > 2000000UL) {
-            (void)send_all(sock, "ERR syntax\n", 11);
+            (void)io_send(io,  "ERR syntax\n", 11);
             return true;
         }
 
@@ -1583,7 +1653,7 @@ static bool handle_command(int sock)
             );
         }
 
-        (void)send_all(sock, response, (size_t)n);
+        (void)io_send(io,  response, (size_t)n);
         return true;
     }
 
@@ -1597,7 +1667,7 @@ static bool handle_command(int sock)
         xSemaphoreGive(s_swd_lock);
 
         if (st == SWD_OK) {
-            (void)send_all(sock,"OK RESUMED\n",11);
+            (void)io_send(io, "OK RESUMED\n",11);
         } else {
             char response[64];
 
@@ -1608,7 +1678,7 @@ static bool handle_command(int sock)
                 swd_status_name(st)
             );
 
-            (void)send_all(sock,response,(size_t)n);
+            (void)io_send(io, response,(size_t)n);
         }
 
         return true;
@@ -1626,7 +1696,7 @@ static bool handle_command(int sock)
             *end != '\0' ||
             regno > 19UL) {
 
-            (void)send_all(sock,"ERR syntax\n",11);
+            (void)io_send(io, "ERR syntax\n",11);
             return true;
         }
 
@@ -1666,7 +1736,7 @@ static bool handle_command(int sock)
             );
         }
 
-        (void)send_all(sock,response,(size_t)n);
+        (void)io_send(io, response,(size_t)n);
         return true;
     }
 
@@ -1679,7 +1749,7 @@ static bool handle_command(int sock)
             strtoul(line + 9, &end, 0);
 
         if (end == line + 9 || *end != ' ') {
-            (void)send_all(sock,"ERR syntax\n",11);
+            (void)io_send(io, "ERR syntax\n",11);
             return true;
         }
 
@@ -1687,7 +1757,7 @@ static bool handle_command(int sock)
             strtoul(end + 1, &end, 0);
 
         if (*end != '\0' || regno > 19UL) {
-            (void)send_all(sock,"ERR syntax\n",11);
+            (void)io_send(io, "ERR syntax\n",11);
             return true;
         }
 
@@ -1725,7 +1795,7 @@ static bool handle_command(int sock)
             );
         }
 
-        (void)send_all(sock,response,(size_t)n);
+        (void)io_send(io, response,(size_t)n);
         return true;
     }
 
@@ -1733,7 +1803,7 @@ static bool handle_command(int sock)
         char *end = NULL;
         unsigned long address = strtoul(line + 6, &end, 0);
         if (end == line + 6 || *end != ' ') {
-            (void)send_all(sock, "ERR syntax\n", 11);
+            (void)io_send(io,  "ERR syntax\n", 11);
             return true;
         }
         unsigned long length = strtoul(end + 1, &end, 0);
@@ -1742,20 +1812,20 @@ static bool handle_command(int sock)
             length > 0x40000UL ||
             !swd_range_contains((uint32_t)address, (size_t)length,
                                 SWD_MEM_FLASH_BASE, SWD_MEM_NVM_BASE)) {
-            (void)send_all(sock, "ERR range\n", 10);
+            (void)io_send(io,  "ERR range\n", 10);
             return true;
         }
-        if (!send_all(sock, "OK\n", 3)) {
+        if (!io_send(io,  "OK\n", 3)) {
             return false;
         }
         uint8_t *payload = (uint8_t *)malloc((size_t)length);
         if (payload == NULL) {
-            (void)send_all(sock, "ERR memory\n", 11);
+            (void)io_send(io,  "ERR memory\n", 11);
             return false;
         }
         size_t got = 0;
         while (got < (size_t)length) {
-            int n = recv(sock, payload + got, (size_t)length - got, 0);
+            int n = io_recv(io, payload + got, (size_t)length - got);
             if (n <= 0) {
                 free(payload);
                 return false;
@@ -1773,12 +1843,37 @@ static bool handle_command(int sock)
         } else {
             rn = snprintf(resp, sizeof(resp), "ERR SWD %s\n", swd_status_name(st));
         }
-        (void)send_all(sock, resp, (size_t)rn);
+        (void)io_send(io,  resp, (size_t)rn);
         return true;
     }
 
-    (void)send_all(sock, "ERR command\n", 12);
+    (void)io_send(io,  "ERR command\n", 12);
     return true;
+}
+
+esp_err_t swd_bridge_exec(const char *line, uint8_t **out, size_t *out_len,
+                          size_t max_out)
+{
+    *out = NULL;
+    *out_len = 0;
+    if (s_swd_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_bitbang_active) {
+        return ESP_ERR_NOT_FINISHED;   /* OpenOCD owns the probe */
+    }
+    swd_io_t *io = calloc(1, sizeof(*io));
+    if (io == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    io->sock = -1;
+    io->line = line;
+    io->out_max = max_out;
+    (void)handle_command(io);
+    *out = io->out;
+    *out_len = io->out_len;
+    free(io);
+    return ESP_OK;
 }
 
 /* OpenOCD remote_bitbang wire protocol.
@@ -1922,15 +2017,15 @@ static void remote_bitbang_task(void *arg)
         /* No idle timeout: OpenOCD may sit quietly between commands. */
         configure_client_socket(sock, 0);
         xSemaphoreTake(s_swd_lock, portMAX_DELAY);
+        s_bitbang_active = true;
         remote_bitbang_handle_client(sock);
+        s_bitbang_active = false;
         xSemaphoreGive(s_swd_lock);
         shutdown(sock, SHUT_RDWR);
         close(sock);
     }
 }
 
-
-#if CONFIG_ESP_CONSOLE_USB_CDC
 
 static int usb_hex_nibble(char c)
 {
@@ -1968,6 +2063,11 @@ static void swd_usb_rpc_task(void *arg)
         while (len > 0 &&
                (line[len - 1] == '\r' || line[len - 1] == '\n')) {
             line[--len] = '\0';
+        }
+
+        if (strncmp(line, "@CMD ", 5) == 0) {
+            cmd_usb_line(line + 5);
+            continue;
         }
 
         if (strncmp(line, "@SWD ", 5) != 0) {
@@ -2231,7 +2331,6 @@ static void swd_usb_rpc_task(void *arg)
     }
 }
 
-#endif /* CONFIG_ESP_CONSOLE_USB_CDC */
 
 static void swd_task(void *arg)
 {
@@ -2269,8 +2368,13 @@ static void swd_task(void *arg)
         }
         configure_client_socket(sock, SWD_TEXT_IDLE_TIMEOUT_S);
         /* Several commands per connection. One-command-per-connection clients
-         * keep working: they close, recv_line() sees EOF, we loop back. */
-        while (handle_command(sock)) {
+         * keep working: they close, io_recv_line() sees EOF, we loop back. */
+        swd_io_t *io = calloc(1, sizeof(*io));
+        if (io != NULL) {
+            io->sock = sock;
+            while (handle_command(io)) {
+            }
+            free(io);
         }
         shutdown(sock, SHUT_RDWR);
         close(sock);
@@ -2323,9 +2427,8 @@ void swd_bridge_start(void)
     }
     s_swd_lock = xSemaphoreCreateMutex();
     configASSERT(s_swd_lock != NULL);
-    xTaskCreate(swd_task, "swd", 6144, NULL, 5, NULL);
-#if CONFIG_ESP_CONSOLE_USB_CDC
+    xTaskCreatePinnedToCore(swd_task, "swd", 6144, NULL, 5, NULL, BRIDGE_IO_CORE);
     xTaskCreate(swd_usb_rpc_task, "swd_usb_rpc", 6144, NULL, 4, NULL);
-#endif
-    xTaskCreate(remote_bitbang_task, "remote_bitbang", 4096, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(remote_bitbang_task, "remote_bitbang", 4096, NULL, 5, NULL,
+                            BRIDGE_IO_CORE);
 }
