@@ -73,6 +73,7 @@ static const char *TAG = "bridge";
  * 115200 while still batching back-to-back bytes. */
 #define RX_TIMEOUT_SYMBOLS  4
 #define MAX_TAPS            2
+#define UART_TX_RING        2048
 
 /* A client that vanished without FIN (Wi-Fi drop, laptop sleep) is detected
  * after IDLE + INTVL * CNT = 11 s instead of lwIP's default two hours. */
@@ -196,7 +197,8 @@ static void uart_init_channel(channel_t *ch)
     ch->lock = xSemaphoreCreateMutex();
     assert(ch->lock != NULL);
 
-    ESP_ERROR_CHECK(uart_driver_install(ch->uart, ch->rx_buf, ch->rx_buf,
+    /* TX ring only needs to absorb one TCP chunk (1 KB) while it drains. */
+    ESP_ERROR_CHECK(uart_driver_install(ch->uart, ch->rx_buf, UART_TX_RING,
                                         UART_EVT_QUEUE_LEN, &ch->evt_queue, 0));
     ESP_ERROR_CHECK(uart_param_config(ch->uart, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(ch->uart, ch->tx_gpio, ch->rx_gpio,

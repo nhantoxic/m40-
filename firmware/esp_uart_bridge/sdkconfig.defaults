@@ -15,15 +15,9 @@ CONFIG_LWIP_TCP_WND_DEFAULT=5760
 
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 
-# Performance: -O2 instead of -Og, full CPU clock (S2 default is 160 MHz),
-# lwIP hot paths in IRAM. The SWD bit-bang delay is computed from the CPU
-# clock, so the configured SWD kHz stays the same.
+# -O2 instead of -Og. CPU clock and IRAM placement are per chip: on the S2,
+# IRAM comes out of the heap (see sdkconfig.defaults.esp32s2).
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
-CONFIG_LWIP_IRAM_OPTIMIZATION=y
-# UART interrupt stays serviceable while flash is busy (NVS writes from the
-# app), so the 128-byte RX FIFO cannot overflow during a settings save.
-CONFIG_UART_ISR_IN_IRAM=y
 
 # Web app + command API: WebSocket terminal, room for the extra sockets
 # (UART/SWD/bitbang listeners + clients, httpd, discovery, mDNS), browser

@@ -27,7 +27,7 @@ RTC_NOINIT_ATTR static uint32_t s_crashes;
 static boot_mode_t s_mode;
 static uint32_t s_boot_crashes;   /* counter value at this boot (for reports) */
 static esp_reset_reason_t s_reason;
-static char s_summary[200];
+static char s_summary[240];
 
 static const char *reason_name(esp_reset_reason_t r)
 {
@@ -63,8 +63,12 @@ static void load_coredump(void)
         return;
     }
     if (esp_core_dump_get_summary(sum) == ESP_OK) {
-        int n = snprintf(s_summary, sizeof(s_summary), "task=%s pc=0x%08lx bt=",
-                         sum->exc_task, (unsigned long)sum->exc_pc);
+        /* cause: Xtensa EXCCAUSE (e.g. 28/29 = load/store to a bad address,
+         * 0 with a watchdog reset = the CPU was stuck at pc). */
+        int n = snprintf(s_summary, sizeof(s_summary), "task=%s pc=0x%08lx cause=%lu vaddr=0x%08lx bt=",
+                         sum->exc_task, (unsigned long)sum->exc_pc,
+                         (unsigned long)sum->ex_info.exc_cause,
+                         (unsigned long)sum->ex_info.exc_vaddr);
         for (uint32_t i = 0; i < sum->exc_bt_info.depth && i < 12 && n < (int)sizeof(s_summary) - 12; i++) {
             n += snprintf(s_summary + n, sizeof(s_summary) - n, "%s0x%08lx", i ? " " : "",
                           (unsigned long)sum->exc_bt_info.bt[i]);

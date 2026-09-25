@@ -24,6 +24,7 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "lwip/sockets.h"
 
 #include "cmd.h"
@@ -296,11 +297,20 @@ static void on_close(httpd_handle_t hd, int fd)
 
 /* ------------------------------------------------------------ start */
 
+bool web_running(void)
+{
+    return s_server != NULL;
+}
+
 void web_start(void)
 {
     s_cmd_queue = xQueueCreate(CMD_QUEUE_LEN, sizeof(cmd_job_t *));
-    assert(s_cmd_queue != NULL);
-    xTaskCreate(cmd_worker, "cmd_worker", 6144, NULL, 4, NULL);
+    if (s_cmd_queue == NULL ||
+        xTaskCreate(cmd_worker, "cmd_worker", 6144, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "no memory for the command worker (free heap %u)",
+                 (unsigned)esp_get_free_heap_size());
+        return;
+    }
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_open_sockets = 7;
@@ -315,7 +325,9 @@ void web_start(void)
 
     esp_err_t err = httpd_start(&s_server, &cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "httpd_start: %s (free heap %u)", esp_err_to_name(err),
+                 (unsigned)esp_get_free_heap_size());
+        s_server = NULL;
         return;
     }
 

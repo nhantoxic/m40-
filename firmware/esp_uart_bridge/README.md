@@ -15,9 +15,9 @@ hoặc **ESP32-S3** (DevKitC-1 / module S3). Có sẵn:
 | | ESP32-S2 (LOLIN S2 mini) | ESP32-S3 (DevKitC-1) |
 |---|---|---|
 | Env PlatformIO | `lolin_s2_mini` | `esp32s3` |
-| CPU | 1 nhân, 240 MHz | 2 nhân, 240 MHz: Wi-Fi/lwIP ở core 0, bơm UART + SWD bit-bang ở core 1 |
-| Heap lúc chạy | ~150 KB | ~240 KB |
-| Bộ đệm | UART ring 8 KB, `uart.read` 4 KB, TCP window 5,7 KB | UART ring 16 KB, `uart.read` 16 KB, TCP window 11,5 KB, `swd READ` tối đa 16 KB |
+| CPU | 1 nhân, 160 MHz (IRAM trên S2 lấy từ heap; xem `sdkconfig.defaults.esp32s2`) | 2 nhân, 240 MHz: Wi-Fi/lwIP ở core 0, bơm UART + SWD bit-bang ở core 1 |
+| Heap lúc boot | ~167 KB | ~300 KB |
+| Bộ đệm | UART ring 4 KB mỗi kênh, `uart.read` 4 KB, TCP window 5,7 KB | UART ring 16 KB, `uart.read` 16 KB, TCP window 11,5 KB, `swd READ` tối đa 16 KB |
 | USB | ROM USB-CDC (DTR=0, RTS=1 mới có dữ liệu) | USB-Serial-JTAG |
 | UART MCU (tcp 2324) | UART1: TX **GPIO35**, RX **GPIO33** | UART1: TX **GPIO17**, RX **GPIO21** |
 | UART SoC shell (tcp 2323) | UART0: TX **GPIO37**, RX **GPIO39** | UART2: TX **GPIO38**, RX **GPIO39** |

@@ -210,6 +210,8 @@ void app_main(void)
         return;
     }
 
+    ESP_LOGI(TAG, "free heap after start: %u bytes (min %u)",
+             (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
     ESP_LOGI(TAG, "ready: app http://%s.local/, raw UART tcp/%d, SWD tcp/%d",
              CONFIG_BRIDGE_HOSTNAME, CONFIG_BRIDGE_TCP_PORT, CONFIG_BRIDGE_SWD_TCP_PORT);
     ESP_LOGW(TAG, "LAN services have no application password; use a trusted network");

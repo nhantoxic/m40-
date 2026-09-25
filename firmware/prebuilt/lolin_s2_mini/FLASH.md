@@ -36,7 +36,10 @@ Firmware tự đếm số lần crash sớm (trong vòng 60 s sau khi boot) liê
 | 2–3 | **safe**: chỉ Wi-Fi, discovery, web và lệnh (tắt UART, SWD, mDNS; giảm công suất phát Wi-Fi) | `bridge_tool.py discover` → các trường `boot_mode`, `reset_reason`, `crash` |
 | ≥ 4 | **usb_only**: tắt cả Wi-Fi | mở cổng COM của board (DTR=0, RTS=1): cứ 5 s in `[crashlog] …`; gửi `@CMD crash` |
 
-`crash` có dạng `task=<tên> pc=0x… bt=0x… 0x…`. Giải mã bằng ELF trong thư mục này:
+Discovery còn có `free_heap`, `min_free_heap` và `http_ok` (web server có chạy không).
+
+`crash` có dạng `task=<tên> pc=0x… cause=<n> vaddr=0x… bt=0x… 0x…`. `cause` là mã EXCCAUSE của
+Xtensa: 28/29 = đọc/ghi địa chỉ sai (xem `vaddr`); 0 kèm `reset_reason` watchdog = CPU bị kẹt tại `pc`. Giải mã bằng ELF trong thư mục này:
 
 ```powershell
 xz -d esp_uart_bridge.elf.xz

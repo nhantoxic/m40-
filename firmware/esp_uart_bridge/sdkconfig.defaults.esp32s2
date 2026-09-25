@@ -1,5 +1,16 @@
 # LOLIN S2 mini (ESP32-S2FN4R2, single core, 4 MB flash).
 
+# Memory and power: on the S2 every byte of IRAM is taken from the heap, and
+# the web server, two UART channels and AP+STA Wi-Fi need that heap (with the
+# IRAM options below httpd, DHCP and discovery ran out of memory on hardware).
+# 160 MHz is also what this board ran reliably with the ROM USB console, and
+# it draws less current on a weak supply.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+# CONFIG_LWIP_IRAM_OPTIMIZATION is not set
+# CONFIG_UART_ISR_IN_IRAM is not set
+CONFIG_BRIDGE_UART_RX_BUF=4096
+CONFIG_BRIDGE_SOC_UART_RX_BUF=4096
+
 # No UART0 pins on the headers: console over the native USB port (ROM CDC).
 CONFIG_ESP_CONSOLE_USB_CDC=y
 CONFIG_ESP_CONSOLE_USB_CDC_SUPPORT_ETS_PRINTF=y
