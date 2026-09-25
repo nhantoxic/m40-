@@ -1,0 +1,215 @@
+menu "Dreame bridge configuration"
+
+config BRIDGE_WIFI_SSID
+    string "Wi-Fi SSID"
+    default "changeme"
+    help
+        SSID of the network the bridge joins. The bridge is a station only;
+        it never opens an access point.
+
+config BRIDGE_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default "changeme"
+    help
+        WPA2 passphrase. Leave empty for an open network.
+
+config BRIDGE_WIFI_SSID_FALLBACK
+    string "Fallback Wi-Fi SSID (optional)"
+    default ""
+    help
+        Secondary SSID tried with the same password after the primary one has
+        failed CONFIG_BRIDGE_WIFI_MAX_RETRY times. The board usually sits
+        inside a robot where the SSID cannot be corrected by hand, so a typo or
+        an AP that only covers part of the site must not strand the bridge.
+        Leave empty to disable.
+
+config BRIDGE_WIFI_MAX_RETRY
+    int "Reconnect attempts before backing off"
+    default 8
+    help
+        After this many consecutive failures the bridge waits 30 s before
+        trying again, so a wrong password does not hammer the AP forever.
+
+config BRIDGE_HOSTNAME
+    string "DHCP hostname"
+    default "dreame-bridge"
+
+config BRIDGE_DISCOVERY_ENABLE
+    bool "Enable LAN discovery"
+    default y
+    help
+        Listen for a short UDP discovery request so RobotMonitor can find the
+        bridge without a fixed IP. This does not expose Wi-Fi credentials.
+
+config BRIDGE_DISCOVERY_PORT
+    int "LAN discovery UDP port"
+    default 2326
+    help
+        UDP port used by the RobotMonitor discovery request and response.
+
+config BRIDGE_TCP_PORT
+    int "TCP port for the primary UART (SoC in dual-UART mode)"
+    default 2323
+
+config BRIDGE_UART_TX_GPIO
+    int "GPIO that drives the primary UART peer RX line"
+    default 16
+    help
+        GPIO16 is the default peer-TX pin in dual-UART profiles. The temporary
+        UART-only profile overrides this to GPIO35. This is ESP-side routing;
+        it does not identify which robot-side UART is connected. Put a 1 kohm
+        resistor in series after verifying the robot pin.
+
+config BRIDGE_UART_RX_GPIO
+    int "GPIO that listens to the primary UART peer TX line"
+    default 18
+    help
+        GPIO18 is the default peer-RX pin in dual-UART profiles. The temporary
+        UART-only profile overrides this to GPIO33. This is ESP-side routing;
+        it does not identify which robot-side UART is connected. Also use
+        1 kohm in series after verifying the robot pin.
+
+config BRIDGE_UART_BAUD
+    int "UART baud rate"
+    default 230400
+
+config BRIDGE_UART_AUTOBAUD
+    bool "Probe several baud rates on the primary UART at boot"
+    default n
+    help
+        Runs 230400/115200/57600/9600 in turn, sends a line feed and "info -a"
+        at each, and locks onto the first rate that produces bytes. Adds about
+        six seconds to boot.
+
+        Only enable this while bringing up a new wiring harness. It transmits
+        garbage into the peer at every rate that does not match, and the peer's
+        prompt is never a place to send bytes you have not reasoned about.
+
+config BRIDGE_UART_EVEN_PARITY
+    bool "Primary UART even parity"
+    default n
+    help
+        Older X40/MR813 reference firmware was analyzed as 230400 8N1. The
+        live MCU image and the physical UART endpoint must be verified before
+        treating that setting as the command-channel format.
+
+config BRIDGE_UART_RX_BUF
+    int "UART driver RX ring buffer (bytes)"
+    default 8192
+    help
+        Data that arrives while no TCP client is connected is discarded on
+        connect, so this only needs to absorb bursts during a live session.
+
+config BRIDGE_UART_SW_FLOWCTRL
+    bool "Software flow control (ixoff) toward the robot"
+    default n
+    help
+        When the hardware UART RX FIFO reaches 96 bytes, the bridge sends an
+        XOFF byte (0x13) on its TX line and an XON byte (0x11) after it drains
+        below 32 bytes. This can prevent loss if the robot floods the console
+        while Wi-Fi is slower than 115200 baud, but enable it only after
+        confirming that the robot honours XON/XOFF. It is disabled by default
+        because an unsupported peer could treat these bytes as console input.
+
+config BRIDGE_MCU_UART_ENABLE
+    bool "Enable the MCU ARM UART bridge"
+    default y
+    help
+        Expose a second UART channel on a TCP port. The selected robot-side
+        pins must be verified as the MCU UART before labeling or using this
+        channel as the MCU command/update path. UART0 is used here because the
+        ESP console is on native USB CDC, not on a UART pin.
+
+config BRIDGE_MCU_TCP_PORT
+    int "TCP port assigned to the MCU ARM UART channel"
+    default 2324
+
+config BRIDGE_MCU_UART_TX_GPIO
+    int "GPIO that drives the MCU UART RX line"
+    default 35
+    help
+        LOLIN S2 mini connector-row default: GPIO35 (ESP TX). Connect it to
+        MCU RX only after tracing the robot-side signal. GPIO16/18 are reserved
+        for SWDIO/SWCLK.
+
+config BRIDGE_MCU_UART_RX_GPIO
+    int "GPIO that listens to the MCU UART TX line"
+    default 33
+    help
+        LOLIN S2 mini connector-row default: GPIO33 (ESP RX). Connect it to
+        MCU TX only after tracing the robot-side signal. GPIO16/18 are reserved
+        for SWDIO/SWCLK.
+
+config BRIDGE_MCU_UART_BAUD
+    int "MCU UART baud rate"
+    default 230400
+    help
+        This is a configured rate only. Verify the current MCU image and
+        physical command UART before treating it as the MCU CLI baud.
+
+config BRIDGE_MCU_UART_EVEN_PARITY
+    bool "MCU UART even parity"
+    default n
+    help
+        Older X40/MR813 reference firmware was analyzed as 8N1. Verify the
+        live image and command UART before relying on that assumption.
+
+config BRIDGE_MCU_UART_RX_BUF
+    int "MCU UART driver RX ring buffer (bytes)"
+    default 8192
+
+config BRIDGE_LED_GPIO
+    int "Status LED GPIO, -1 to disable"
+    default 15
+    help
+        LOLIN S2 mini: GPIO15, active high. ESP32-S3-DevKitC-1 has an
+        addressable RGB LED instead, so set this to -1 there.
+
+config BRIDGE_FLUSH_ON_CONNECT
+    bool "Discard buffered UART data when a client connects"
+    default y
+    help
+        Prevents a new client from being greeted with minutes-old, truncated
+        log fragments. Turn off if you want to catch a boot log without being
+        connected first.
+
+config BRIDGE_SWD_ENABLE
+    bool "Enable SWD bridge"
+    default y
+    help
+        Expose SWD diagnostics, core control, and memory operations over TCP.
+        The text API includes SRAM and Flash writes. GPIO16/GPIO18 are reserved
+        for SWDIO/SWCLK in the S2 mini wiring.
+
+config BRIDGE_SWD_TCP_PORT
+    int "SWD text TCP port"
+    help
+        The text endpoint supports memory reads, core debug controls, SRAM
+        writes, and Flash writes. Keep the bridge on a trusted LAN.
+    default 2325
+
+config BRIDGE_SWD_REMOTE_BITBANG_TCP_PORT
+    int "OpenOCD remote-bitbang TCP port"
+    default 3335
+
+config BRIDGE_SWDIO_GPIO
+    int "SWDIO GPIO"
+    default 16
+
+config BRIDGE_SWCLK_GPIO
+    int "SWCLK GPIO"
+    default 18
+
+config BRIDGE_SWD_CLOCK_KHZ
+    int "SWD clock (kHz)"
+    default 1000
+    help
+        The software SWD engine uses a CPU-cycle delay to approximate this
+        clock. GPIO and protocol overhead affect the actual rate. The
+        remote-bitbang/OpenOCD path is a separate transport.
+
+config BRIDGE_SWD_MAX_READ
+    int "Maximum bytes per SWD read request"
+    default 4096
+
+endmenu

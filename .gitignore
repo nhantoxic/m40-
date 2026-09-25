@@ -1,0 +1,19 @@
+# ESP-IDF / PlatformIO build output
+build/
+.pio/
+managed_components/
+dependencies.lock
+
+# sdkconfig holds the Wi-Fi SSID/password: never commit it.
+# Commit changes to sdkconfig.defaults instead.
+sdkconfig
+sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+
+# Backups, dumps and logs
+*.bak*
+*.bin
+*.elf
+*.log
+__pycache__/
