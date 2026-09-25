@@ -62,22 +62,10 @@ static void discovery_task(void *arg)
         uint8_t mac[6] = { 0 };
         esp_read_mac(mac, ESP_MAC_WIFI_STA);
 
-        /* Report the MCU UART when dual-UART mode is enabled. */
-#if CONFIG_BRIDGE_MCU_UART_ENABLE
-        const int mcu_port = CONFIG_BRIDGE_MCU_TCP_PORT;
-        const int report_channel = 1;
-        const int report_baud = CONFIG_BRIDGE_MCU_UART_BAUD;
-        const int report_tx_gpio = CONFIG_BRIDGE_MCU_UART_TX_GPIO;
-        const int report_rx_gpio = CONFIG_BRIDGE_MCU_UART_RX_GPIO;
-#ifdef CONFIG_BRIDGE_MCU_UART_EVEN_PARITY
-        const char *uart_mode = "8E1";
-#else
-        const char *uart_mode = "8N1";
-#endif
-#else
+        /* uart_port/mcu_port: robot MCU (RobotMonitor). soc_port: SoC shell, 0 if disabled. */
         const int mcu_port = CONFIG_BRIDGE_TCP_PORT;
-        const int report_channel = 0;
-        const int report_baud = uart_tcp_bridge_baud();
+        const int report_channel = BRIDGE_CH_MCU;
+        const int report_baud = uart_tcp_bridge_baud(BRIDGE_CH_MCU);
         const int report_tx_gpio = CONFIG_BRIDGE_UART_TX_GPIO;
         const int report_rx_gpio = CONFIG_BRIDGE_UART_RX_GPIO;
 #ifdef CONFIG_BRIDGE_UART_EVEN_PARITY
@@ -85,7 +73,8 @@ static void discovery_task(void *arg)
 #else
         const char *uart_mode = "8N1";
 #endif
-#endif
+        const int soc_port = uart_tcp_bridge_tcp_port(BRIDGE_CH_SOC);
+        const int soc_baud = uart_tcp_bridge_baud(BRIDGE_CH_SOC);
 
         uart_tcp_bridge_stats_t stats = { 0 };
         uart_tcp_bridge_get_stats(report_channel, &stats);
@@ -96,7 +85,7 @@ static void discovery_task(void *arg)
             "{\"protocol\":\"dreame-bridge-discovery/1\","
             "\"name\":\"%s\",\"ip\":\"%s\","
             "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
-            "\"uart_port\":%d,\"mcu_port\":%d,\"uart_mode\":\"%s\","
+            "\"uart_port\":%d,\"mcu_port\":%d,\"soc_port\":%d,\"soc_baud\":%d,\"uart_mode\":\"%s\","
             "\"uart_baud\":%d,\"tx_gpio\":%d,\"rx_gpio\":%d,"
             "\"uart_tx_level\":%d,\"uart_rx_level\":%d,"
             "\"swd_port\":%d,\"bitbang_port\":%d,\"http_port\":80,\"setup_ap\":%s,"
@@ -106,7 +95,7 @@ static void discovery_task(void *arg)
             CONFIG_BRIDGE_HOSTNAME,
             wifi_mgr_sta_up() ? wifi_mgr_ip() : (wifi_mgr_ap_active() ? "192.168.4.1" : "0.0.0.0"),
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            CONFIG_BRIDGE_TCP_PORT, mcu_port, uart_mode,
+            CONFIG_BRIDGE_TCP_PORT, mcu_port, soc_port, soc_baud, uart_mode,
             report_baud,
             report_tx_gpio, report_rx_gpio,
             gpio_get_level(report_tx_gpio),

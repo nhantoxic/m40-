@@ -5,9 +5,8 @@
  * command rewriting. This is important for both the root console and the
  * RobotMonitor protocol.
  *
- * The ESP console is native USB CDC, so UART0 is available for the MCU channel.
- * The primary channel uses UART1; in the temporary S2 mini profile it is
- * routed to the MCU UART pins instead of the SoC pins.
+ * Channel 0 (MCU) uses UART1, tcp/2324. Channel 1 (SoC Linux shell) uses
+ * UART0, tcp/2323; UART0 is free because the ESP console is on native USB.
  *
  * Two tasks per channel, both fully blocking (no polling):
  *   uart_rx task  - sole reader of the UART. Wakes on the driver's event queue,
@@ -61,8 +60,9 @@ static const char *TAG = "bridge";
 #define BACKLOG_SIZE 0
 #endif
 
-#define SOC_UART_PORT       UART_NUM_1
-#define MCU_UART_PORT       UART_NUM_0
+/* UART0 is free: the ESP console is on native USB (CDC or USB-Serial-JTAG). */
+#define PRIMARY_UART_PORT   UART_NUM_1
+#define SOC_UART_PORT       CONFIG_BRIDGE_SOC_UART_NUM
 #define CHUNK               1024
 #define LISTEN_BACKLOG      2
 #define UART_EVT_QUEUE_LEN  32
@@ -90,6 +90,7 @@ static const char *TAG = "bridge";
 
 typedef struct {
     const char *name;
+    int index;                 /* BRIDGE_CH_* */
     uart_port_t uart;
     int tcp_port;
     int tx_gpio;
@@ -123,18 +124,17 @@ typedef struct {
 static uart_tcp_bridge_tap_t s_taps[MAX_TAPS];
 
 static volatile bool s_soc_client;
-#if CONFIG_BRIDGE_MCU_UART_ENABLE
-static volatile bool s_mcu_client;
+#if CONFIG_BRIDGE_SOC_UART_ENABLE
+static volatile bool s_soc_shell_client;
 #endif
 
 /* File scope so uart_tcp_bridge_get_stats() can reach them. Each channel owns
  * exactly one UART and its tasks live for the lifetime of the firmware. */
 static channel_t s_channel_primary = {
-    /* In the temporary MCU profile this proven UART1 path is connected to the
-     * MCU instead of the SoC. Keep the transport-neutral label so the log
-     * cannot claim the wrong target. */
-    .name         = "primary",
-    .uart         = SOC_UART_PORT,
+    /* Robot MCU (parameter/CLI UART). */
+    .name         = "mcu",
+    .index        = BRIDGE_CH_MCU,
+    .uart         = PRIMARY_UART_PORT,
     .tcp_port     = CONFIG_BRIDGE_TCP_PORT,
     .tx_gpio      = CONFIG_BRIDGE_UART_TX_GPIO,
     .rx_gpio      = CONFIG_BRIDGE_UART_RX_GPIO,
@@ -150,22 +150,25 @@ static channel_t s_channel_primary = {
     .client       = -1,
 };
 
-#if CONFIG_BRIDGE_MCU_UART_ENABLE
-static channel_t s_channel_mcu = {
-    .name         = "mcu",
-    .uart         = MCU_UART_PORT,
-    .tcp_port     = CONFIG_BRIDGE_MCU_TCP_PORT,
-    .tx_gpio      = CONFIG_BRIDGE_MCU_UART_TX_GPIO,
-    .rx_gpio      = CONFIG_BRIDGE_MCU_UART_RX_GPIO,
-    .baud         = CONFIG_BRIDGE_MCU_UART_BAUD,
-#ifdef CONFIG_BRIDGE_MCU_UART_EVEN_PARITY
+#if CONFIG_BRIDGE_SOC_UART_ENABLE
+_Static_assert(CONFIG_BRIDGE_SOC_UART_NUM != 1, "UART1 is the MCU channel");
+_Static_assert(CONFIG_BRIDGE_SOC_UART_NUM < SOC_UART_HP_NUM, "this chip has no such UART");
+static channel_t s_channel_soc = {
+    .name         = "soc",
+    .index        = BRIDGE_CH_SOC,
+    .uart         = SOC_UART_PORT,
+    .tcp_port     = CONFIG_BRIDGE_SOC_TCP_PORT,
+    .tx_gpio      = CONFIG_BRIDGE_SOC_UART_TX_GPIO,
+    .rx_gpio      = CONFIG_BRIDGE_SOC_UART_RX_GPIO,
+    .baud         = CONFIG_BRIDGE_SOC_UART_BAUD,
+#ifdef CONFIG_BRIDGE_SOC_UART_EVEN_PARITY
     .even_parity  = true,
 #else
     .even_parity  = false,
 #endif
-    .rx_buf       = CONFIG_BRIDGE_MCU_UART_RX_BUF,
+    .rx_buf       = CONFIG_BRIDGE_SOC_UART_RX_BUF,
     .sw_flowctrl  = false,
-    .client_flag  = &s_mcu_client,
+    .client_flag  = &s_soc_shell_client,
     .client       = -1,
 };
 #endif
@@ -173,8 +176,8 @@ static channel_t s_channel_mcu = {
 bool uart_tcp_bridge_has_client(void)
 {
     return s_soc_client
-#if CONFIG_BRIDGE_MCU_UART_ENABLE
-           || s_mcu_client
+#if CONFIG_BRIDGE_SOC_UART_ENABLE
+           || s_soc_shell_client
 #endif
            ;
 }
@@ -309,11 +312,9 @@ static void drain_uart(channel_t *ch)
         }
         ch->rx_bytes += (uint32_t)n;
         forward_to_client(ch, ch->rx_chunk, (size_t)n);
-        if (ch == &s_channel_primary) {
-            for (int i = 0; i < MAX_TAPS; i++) {
-                if (s_taps[i] != NULL) {
-                    s_taps[i](ch->rx_chunk, (size_t)n);
-                }
+        for (int i = 0; i < MAX_TAPS; i++) {
+            if (s_taps[i] != NULL) {
+                s_taps[i](ch->index, ch->rx_chunk, (size_t)n);
             }
         }
     }
@@ -685,28 +686,47 @@ static void tcp_task(void *arg)
     }
 }
 
+static channel_t *channel(int index)
+{
+    switch (index) {
+    case BRIDGE_CH_MCU:
+        return &s_channel_primary;
+#if CONFIG_BRIDGE_SOC_UART_ENABLE
+    case BRIDGE_CH_SOC:
+        return &s_channel_soc;
+#endif
+    default:
+        return NULL;
+    }
+}
+
+bool uart_tcp_bridge_enabled(int index)
+{
+    return channel(index) != NULL;
+}
+
+bool uart_tcp_bridge_channel_has_client(int index)
+{
+    const channel_t *ch = channel(index);
+    return ch != NULL && *ch->client_flag;
+}
+
+int uart_tcp_bridge_tcp_port(int index)
+{
+    const channel_t *ch = channel(index);
+    return ch ? ch->tcp_port : 0;
+}
+
 void uart_tcp_bridge_get_stats(int index, uart_tcp_bridge_stats_t *out)
 {
-    const channel_t *ch = NULL;
-
     if (out == NULL) {
         return;
     }
     *out = (uart_tcp_bridge_stats_t){ 0 };
-
-    switch (index) {
-    case 0:
-        ch = &s_channel_primary;
-        break;
-#if CONFIG_BRIDGE_MCU_UART_ENABLE
-    case 1:
-        ch = &s_channel_mcu;
-        break;
-#endif
-    default:
+    const channel_t *ch = channel(index);
+    if (ch == NULL) {
         return;
     }
-
     out->rx_bytes   = ch->rx_bytes;
     out->tx_bytes   = ch->tx_bytes;
     out->frame_err  = ch->frame_err;
@@ -716,29 +736,38 @@ void uart_tcp_bridge_get_stats(int index, uart_tcp_bridge_stats_t *out)
     out->buf_full   = ch->buf_full;
 }
 
-int uart_tcp_bridge_baud(void)
+int uart_tcp_bridge_baud(int index)
 {
-    return s_channel_primary.baud;
+    const channel_t *ch = channel(index);
+    return ch ? ch->baud : 0;
 }
 
-esp_err_t uart_tcp_bridge_set_baud(int baud)
+esp_err_t uart_tcp_bridge_set_baud(int index, int baud)
 {
+    channel_t *ch = channel(index);
+    if (ch == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
     if (baud < 1200 || baud > 5000000) {
         return ESP_ERR_INVALID_ARG;
     }
-    esp_err_t err = uart_set_baudrate(s_channel_primary.uart, (uint32_t)baud);
+    esp_err_t err = uart_set_baudrate(ch->uart, (uint32_t)baud);
     if (err == ESP_OK) {
-        s_channel_primary.baud = baud;
-        ESP_LOGI(TAG, "primary: baud -> %d", baud);
+        ch->baud = baud;
+        ESP_LOGI(TAG, "%s: baud -> %d", ch->name, baud);
     }
     return err;
 }
 
-int uart_tcp_bridge_write(const uint8_t *data, size_t len)
+int uart_tcp_bridge_write(int index, const uint8_t *data, size_t len)
 {
-    int n = uart_write_bytes(s_channel_primary.uart, (const char *)data, len);
+    channel_t *ch = channel(index);
+    if (ch == NULL) {
+        return -1;
+    }
+    int n = uart_write_bytes(ch->uart, (const char *)data, len);
     if (n > 0) {
-        __atomic_fetch_add(&s_channel_primary.tx_bytes, (uint32_t)n, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&ch->tx_bytes, (uint32_t)n, __ATOMIC_RELAXED);
     }
     return n;
 }
@@ -764,27 +793,28 @@ static void start_channel(channel_t *ch, const char *rx_name, const char *tcp_na
 
 void uart_tcp_bridge_start(void)
 {
-    s_channel_primary.baud = settings_uart_baud();
+    s_channel_primary.baud = settings_uart_baud(BRIDGE_CH_MCU);
     uart_init_channel(&s_channel_primary);
 #if CONFIG_BRIDGE_UART_AUTOBAUD
     autobaud_probe(&s_channel_primary);
 #endif
-    start_channel(&s_channel_primary, "uart_rx", "uart_tcp");
+    start_channel(&s_channel_primary, "mcu_rx", "mcu_tcp");
 
-#if CONFIG_BRIDGE_MCU_UART_ENABLE
-    if (CONFIG_BRIDGE_UART_TX_GPIO == CONFIG_BRIDGE_MCU_UART_TX_GPIO ||
-        CONFIG_BRIDGE_UART_TX_GPIO == CONFIG_BRIDGE_MCU_UART_RX_GPIO ||
-        CONFIG_BRIDGE_UART_RX_GPIO == CONFIG_BRIDGE_MCU_UART_TX_GPIO ||
-        CONFIG_BRIDGE_UART_RX_GPIO == CONFIG_BRIDGE_MCU_UART_RX_GPIO) {
-        ESP_LOGE(TAG, "SoC and MCU UART GPIOs overlap");
+#if CONFIG_BRIDGE_SOC_UART_ENABLE
+    if (CONFIG_BRIDGE_UART_TX_GPIO == CONFIG_BRIDGE_SOC_UART_TX_GPIO ||
+        CONFIG_BRIDGE_UART_TX_GPIO == CONFIG_BRIDGE_SOC_UART_RX_GPIO ||
+        CONFIG_BRIDGE_UART_RX_GPIO == CONFIG_BRIDGE_SOC_UART_TX_GPIO ||
+        CONFIG_BRIDGE_UART_RX_GPIO == CONFIG_BRIDGE_SOC_UART_RX_GPIO) {
+        ESP_LOGE(TAG, "MCU and SoC UART GPIOs overlap");
         abort();
     }
-    if (CONFIG_BRIDGE_TCP_PORT == CONFIG_BRIDGE_MCU_TCP_PORT) {
-        ESP_LOGE(TAG, "SoC and MCU TCP ports overlap");
+    if (CONFIG_BRIDGE_TCP_PORT == CONFIG_BRIDGE_SOC_TCP_PORT) {
+        ESP_LOGE(TAG, "MCU and SoC TCP ports overlap");
         abort();
     }
 
-    uart_init_channel(&s_channel_mcu);
-    start_channel(&s_channel_mcu, "mcu_rx", "mcu_tcp");
+    s_channel_soc.baud = settings_uart_baud(BRIDGE_CH_SOC);
+    uart_init_channel(&s_channel_soc);
+    start_channel(&s_channel_soc, "soc_rx", "soc_tcp");
 #endif
 }

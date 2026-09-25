@@ -14,13 +14,14 @@ passed through unchanged:
     python bridge_tool.py uart.send "ver -t\\r\\n"
     python bridge_tool.py uart.read 500
     python bridge_tool.py uart.sendhex "3C 00 01 3E"
+    python bridge_tool.py soc.xfer 1000 "uname -a\\n"      # SoC Linux shell (2nd UART)
     python bridge_tool.py swd ID
     python bridge_tool.py swd READ 0x08000000 64
 
 Local commands (run on the PC):
 
     discover     list bridges on the LAN (UDP 2326)
-    term         interactive raw terminal on tcp/2324
+    term         interactive raw terminal on tcp/2324 (MCU); --soc for tcp/2323 (SoC shell)
     app          open the web app in a browser
     mcp          run as an MCP server on stdio (for AI agents)
 
@@ -53,12 +54,14 @@ DISCOVERY_QUERY = b"DREAME_BRIDGE_DISCOVER"
 MDNS_NAME = "dreame-bridge.local"
 SETUP_AP_IP = "192.168.4.1"
 UART_PORT = 2324
+SOC_PORT = 2323
 CMD_TIMEOUT = 45.0
 CACHE_FILE = Path.home() / ".dreame_bridge_host"
 
 # Commands whose last argument is raw data (escapes like \r\n are interpreted
 # by the firmware), so backslashes must be passed through untouched.
-DATA_COMMANDS = {"uart.send", "uart.sendhex", "uart.xfer", "swd"}
+DATA_COMMANDS = {"uart.send", "uart.sendhex", "uart.xfer",
+                 "soc.send", "soc.sendhex", "soc.xfer", "swd"}
 
 
 class BridgeError(Exception):
@@ -87,7 +90,7 @@ def build_line(argv: list[str]) -> str:
         raise BridgeError("empty command")
     name, args = argv[0], argv[1:]
     if name in DATA_COMMANDS:
-        if name == "uart.xfer" and args:
+        if name in ("uart.xfer", "soc.xfer") and args:
             return " ".join([name, args[0]] + ([quote_data(" ".join(args[1:]))] if args[1:] else []))
         if name == "swd":
             return " ".join([name] + args)
@@ -338,7 +341,8 @@ MCP_TOOLS = [
             "return its JSON reply. Same language as the web app and the bridge_tool.py CLI. "
             "Commands: help | status | wifi.scan | wifi.set <ssid> <password> | wifi.forget | "
             "wifi.ap on|off | uart.baud [rate] | uart.send <data> | uart.sendhex <hex> | "
-            "uart.read [wait_ms] | uart.xfer <wait_ms> <data> | swd <cmd> (PING ID DPID PID CTRL "
+            "uart.read [wait_ms] | uart.xfer <wait_ms> <data> | soc.baud/send/sendhex/read/xfer "
+            "(same, for the robot SoC Linux shell UART; uart.* is the robot MCU) | swd <cmd> (PING ID DPID PID CTRL "
             "HALT RESUME STEP REGREAD n REGWRITE n v READ addr len ...) | reboot. "
             "Data escapes: \\r \\n \\t \\0 \\\\ \\\" \\xHH; quote values containing spaces. "
             "UART replies come back as 'text' (JSON string) and 'hex'."),
@@ -351,24 +355,29 @@ MCP_TOOLS = [
     },
     {
         "name": "uart_xfer",
-        "description": ("Send data to the robot UART and return the reply "
-                        "(firmware command: uart.xfer <wait_ms> <data>). The reply ends after 100 ms "
-                        "of silence or wait_ms. Remember the line ending, e.g. 'info -a\\r\\n'."),
+        "description": ("Send data to a robot UART and return the reply "
+                        "(firmware: uart.xfer / soc.xfer <wait_ms> <data>). channel 'mcu' = robot MCU "
+                        "CLI, 'soc' = robot SoC Linux shell. The reply ends after 100 ms of silence or "
+                        "wait_ms. Remember the line ending, e.g. 'info -a\\r\\n' (MCU) or 'uname -a\\n' (SoC)."),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "data": {"type": "string", "description": "text with escapes \\r \\n \\xHH"},
                 "wait_ms": {"type": "integer", "default": 1000, "minimum": 0, "maximum": 30000},
+                "channel": {"type": "string", "enum": ["mcu", "soc"], "default": "mcu"},
             },
             "required": ["data"],
         },
     },
     {
         "name": "uart_read",
-        "description": "Return robot UART bytes received since the last read/xfer (firmware: uart.read [wait_ms]).",
+        "description": ("Return bytes received on a robot UART since the last read/xfer "
+                        "(firmware: uart.read / soc.read [wait_ms]). channel 'mcu' or 'soc'."),
         "inputSchema": {"type": "object",
                         "properties": {"wait_ms": {"type": "integer", "default": 0, "minimum": 0,
-                                                   "maximum": 30000}}},
+                                                   "maximum": 30000},
+                                       "channel": {"type": "string", "enum": ["mcu", "soc"],
+                                                   "default": "mcu"}}},
     },
     {
         "name": "bridge_status",
@@ -399,11 +408,12 @@ def mcp_serve(args) -> int:
     def call_tool(name: str, a: dict) -> dict:
         if name == "bridge_command":
             return run_line(str(a.get("command", "")))
+        prefix = "soc" if a.get("channel") == "soc" else "uart"
         if name == "uart_xfer":
             wait = int(a.get("wait_ms", 1000))
-            return run_line(f"uart.xfer {wait} {quote_data(str(a.get('data', '')))}")
+            return run_line(f"{prefix}.xfer {wait} {quote_data(str(a.get('data', '')))}")
         if name == "uart_read":
-            return run_line(f"uart.read {int(a.get('wait_ms', 0))}")
+            return run_line(f"{prefix}.read {int(a.get('wait_ms', 0))}")
         if name == "bridge_status":
             return run_line("status")
         if name == "bridge_discover":
@@ -471,7 +481,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--text", action="store_true", help="print only the UART 'text' of the reply")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--timeout", type=float, default=1.5, help="discover: seconds to wait")
-    p.add_argument("--port", type=int, default=UART_PORT, help="term: raw UART TCP port")
+    p.add_argument("--port", type=int, default=UART_PORT, help="term: raw UART TCP port (MCU 2324)")
+    p.add_argument("--soc", action="store_true", help="term: SoC shell port (tcp/2323)")
     p.add_argument("--eol", choices=["none", "lf", "cr", "crlf"], default="crlf", help="term: line ending")
     p.add_argument("--hex-out", action="store_true", help="term: show received bytes as hex")
     p.add_argument("--log", help="term: append received bytes to this file")
@@ -489,6 +500,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if name == "discover":
             return cmd_discover(args)
         if name == "term":
+            if args.soc:
+                args.port = SOC_PORT
             return cmd_term(args)
         if name == "app":
             return cmd_app(args)

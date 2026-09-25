@@ -18,7 +18,7 @@ with 0 when `ok` is true and 1 otherwise.
 | Command | Reply fields | Notes |
 |---|---|---|
 | `help` | `commands[]{cmd,usage,help}` | lists the commands below |
-| `status` | `fw, uptime_s, free_heap, min_free_heap, wifi{…}, uart{baud,mode,tcp_port,tcp_client,rx_bytes,tx_bytes,frame_err,parity_err,break,fifo_ovf,buf_full,buffered}, swd{…}` | cheap; good first call |
+| `status` | `fw, uptime_s, free_heap, min_free_heap, wifi{…}, uart{baud,mode,tcp_port,tcp_client,rx_bytes,tx_bytes,frame_err,parity_err,break,fifo_ovf,buf_full,buffered}, soc{…same…}, swd{…}` | cheap; good first call. `uart` = MCU, `soc` = SoC shell (absent if disabled) |
 | `wifi.scan` | `networks[]{ssid,rssi,channel,auth,supported}` | ~2–3 s |
 | `wifi.set <ssid> <password>` | `ssid, ip` | saved **only if** an IP is obtained (≤ 20 s), else the old network stays. Quote values with spaces |
 | `wifi.forget` | | erases the network and starts the setup AP |
@@ -28,6 +28,7 @@ with 0 when `ok` is true and 1 otherwise.
 | `uart.sendhex <hex>` | `sent` | `3C 00 0x01,3E` style, max 1024 bytes |
 | `uart.read [wait_ms]` | `len, text, hex, overflow` | bytes received since the last `uart.read`/`uart.xfer`; waits up to `wait_ms` (≤ 30000) for data, returns after 60 ms of silence |
 | `uart.xfer <wait_ms> <data>` | `sent, len, text, hex, overflow` | clears the buffer, sends, collects the reply; returns after 100 ms of silence or `wait_ms` |
+| `soc.baud` / `soc.send` / `soc.sendhex` / `soc.read` / `soc.xfer` | same as `uart.*` | the same commands for the **robot SoC Linux shell** UART (tcp/2323); `uart.*` is the **robot MCU** |
 | `swd <cmd>` | `response`, `data` (hex, for `READ`) | `PING ID DPID PID CTRL RAW HALT RESUME STEP REGREAD n REGWRITE n v RUNUNTIL … READ addr len`. `WRITE`/`MWRITE`/`DUMP` need the raw port tcp/2325 |
 | `reboot` | | restarts after the reply |
 
@@ -54,6 +55,8 @@ data between them.
 
 - Start with `status`. `uart.baud` tells you the rate; `frame_err`/`parity_err`
   going up usually means the baud rate is wrong.
+- Two UARTs: `uart.*` = robot MCU CLI (usually `\r\n`), `soc.*` = robot SoC Linux
+  shell (usually `\n`, e.g. `soc.xfer 1000 "uname -a\n"`; `\x03` is Ctrl+C).
 - Prefer `uart.xfer <wait_ms> "<cmd>\r\n"` for request/response. Use `uart.read`
   to collect spontaneous output (logs).
 - The robot console usually needs `\r\n`; nothing is appended for you.

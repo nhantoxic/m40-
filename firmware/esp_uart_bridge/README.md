@@ -19,7 +19,8 @@ hoặc **ESP32-S3** (DevKitC-1 / module S3). Có sẵn:
 | Heap lúc chạy | ~150 KB | ~240 KB |
 | Bộ đệm | UART ring 8 KB, `uart.read` 4 KB, TCP window 5,7 KB | UART ring 16 KB, `uart.read` 16 KB, TCP window 11,5 KB, `swd READ` tối đa 16 KB |
 | USB | ROM USB-CDC (DTR=0, RTS=1 mới có dữ liệu) | USB-Serial-JTAG |
-| UART robot | TX **GPIO35**, RX **GPIO33** | TX **GPIO17**, RX **GPIO21** |
+| UART MCU (tcp 2324) | UART1: TX **GPIO35**, RX **GPIO33** | UART1: TX **GPIO17**, RX **GPIO21** |
+| UART SoC shell (tcp 2323) | UART0: TX **GPIO37**, RX **GPIO39** | UART2: TX **GPIO38**, RX **GPIO39** |
 | SWD | SWDIO **GPIO16**, SWCLK **GPIO18** | SWDIO **GPIO16**, SWCLK **GPIO18** |
 | LED trạng thái | GPIO15 | không (LED RGB địa chỉ) |
 | Nút cài đặt | BOOT (GPIO0) | BOOT (GPIO0) |
@@ -28,7 +29,9 @@ Chân nằm trong `sdkconfig.defaults.esp32s2` / `sdkconfig.defaults.esp32s3`. T
 có PSRAM octal (N8R8/N16R8) thì **không** dùng GPIO35–37. Mắc điện trở 1 kΩ nối tiếp trên
 TX/RX và SWD sau khi đã xác nhận chân phía robot.
 
-UART mặc định **115200 8N1**; đổi lúc chạy bằng `uart.baud <rate>` (được lưu lại).
+Cả hai UART mặc định **115200 8N1**. Đổi lúc chạy bằng `uart.baud <rate>` (MCU) hoặc
+`soc.baud <rate>` (SoC); giá trị mới được lưu lại. Tắt cổng SoC bằng menuconfig
+`BRIDGE_SOC_UART_ENABLE`.
 
 ## Build và nạp
 
@@ -74,8 +77,10 @@ Chỉ nhận mạng WPA2/WPA3 (mật khẩu 8–63 ký tự); mạng mở bị t
   xem text/hex, CR/LF/CRLF, gửi hex, lịch sử ↑/↓, macro, đổi baud, lưu log), Lệnh / API, SWD.
 - **PC / AI agent**: `tools/bridge_tool.py` — cùng lệnh với app. Xem
   [README gốc](../../README.md) và [`docs/COMMANDS.md`](../../docs/COMMANDS.md).
-- **Raw TCP** (RobotMonitor, YMODEM, PuTTY chế độ *Raw*, **không phải Telnet**): `2324`.
-  Client mới sẽ chiếm quyền client cũ.
+- **Raw TCP** (RobotMonitor, YMODEM, PuTTY chế độ *Raw*, **không phải Telnet**): `2324` = MCU,
+  `2323` = SoC shell. Client mới sẽ chiếm quyền client cũ trên cùng cổng.
+- **Terminal trong app**: ô *Cổng* chuyển giữa MCU và SoC shell (WebSocket `/ws` và `/ws/soc`).
+  Macro và kiểu kết thúc dòng được nhớ riêng cho từng cổng; shell Linux thường dùng `LF`.
 - **SWD text** `2325`: nhiều lệnh trên một kết nối, đóng khi rỗi 60 s.
 - **OpenOCD** `3335` (remote_bitbang, không có NRST → `reset_config none`):
 
@@ -108,7 +113,8 @@ Chỉ nhận mạng WPA2/WPA3 (mật khẩu 8–63 ký tự); mạng mở bị t
 
 ### LAN discovery (UDP 2326)
 
-Gửi `DREAME_BRIDGE_DISCOVER` → JSON gồm `name`, `ip`, `mac`, `uart_port`, `uart_baud`,
+Gửi `DREAME_BRIDGE_DISCOVER` → JSON gồm `name`, `ip`, `mac`, `uart_port`/`mcu_port` (MCU),
+`soc_port`/`soc_baud` (SoC shell, `0` nếu tắt), `uart_baud`,
 `uart_mode`, `swd_port`, `bitbang_port`, `http_port`, `setup_ap`, `uart_tx_level`,
 `uart_rx_level` và `uart_stats`. Cách đọc bộ đếm (cũng có trong `status`):
 

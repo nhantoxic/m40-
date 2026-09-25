@@ -23,8 +23,9 @@ esp_err_t settings_set_wifi(const char *ssid, const char *pass);
 /* Stores an explicit "no network" so the menuconfig fallback is not used. */
 esp_err_t settings_forget_wifi(void);
 
-int settings_uart_baud(void);
-esp_err_t settings_set_uart_baud(int baud);
+/* ch: BRIDGE_CH_MCU or BRIDGE_CH_SOC (see uart_tcp_bridge.h). */
+int settings_uart_baud(int ch);
+esp_err_t settings_set_uart_baud(int ch, int baud);
 
 #ifdef __cplusplus
 }

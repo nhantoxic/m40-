@@ -5,7 +5,8 @@
  *                   Requires an "X-Bridge" header: browsers cannot add it
  *                   cross-site without a CORS preflight, which is never
  *                   granted, so other web pages cannot drive the robot.
- *   GET  /ws        WebSocket: robot UART bytes out (binary), bytes in -> UART
+ *   GET  /ws        WebSocket terminal for the robot MCU UART (binary both ways)
+ *   GET  /ws/soc    same for the robot SoC shell UART
  *
  * Commands run on their own worker task so a long uart.xfer or wifi.set does
  * not freeze the terminal stream.
@@ -13,6 +14,7 @@
 
 #include "web.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,7 +36,7 @@
 static const char *TAG = "web";
 
 #define MAX_BODY        1024
-#define MAX_WS          3
+#define MAX_WS          4
 #define WS_MAX_QUEUED   (16 * 1024)   /* stalled browsers lose data beyond this */
 #define CMD_QUEUE_LEN   4
 
@@ -42,7 +44,8 @@ extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[] asm("_binary_index_html_end");
 
 static httpd_handle_t s_server;
-static int s_ws_fds[MAX_WS] = { -1, -1, -1 };
+static int s_ws_fds[MAX_WS] = { -1, -1, -1, -1 };
+static int s_ws_ch[MAX_WS];      /* BRIDGE_CH_* of each terminal */
 static portMUX_TYPE s_ws_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile int s_ws_count;
 static volatile int s_ws_queued;
@@ -142,13 +145,14 @@ static void ws_remove(int fd)
     portEXIT_CRITICAL(&s_ws_mux);
 }
 
-static bool ws_add(int fd)
+static bool ws_add(int fd, int ch)
 {
     bool added = false;
     portENTER_CRITICAL(&s_ws_mux);
     for (int i = 0; i < MAX_WS && !added; i++) {
         if (s_ws_fds[i] < 0) {
             s_ws_fds[i] = fd;
+            s_ws_ch[i] = ch;
             s_ws_count++;
             added = true;
         }
@@ -187,11 +191,12 @@ static esp_err_t ws_pre_handshake(httpd_req_t *req)
 static esp_err_t ws_post_handshake(httpd_req_t *req)
 {
     int fd = httpd_req_to_sockfd(req);
-    if (!ws_add(fd)) {
+    int ch = (int)(intptr_t)req->user_ctx;
+    if (!ws_add(fd, ch)) {
         ESP_LOGW(TAG, "ws: too many terminals, fd %d refused", fd);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "ws: client fd %d", fd);
+    ESP_LOGI(TAG, "ws: %s terminal fd %d", ch == BRIDGE_CH_SOC ? "soc" : "mcu", fd);
     return ESP_OK;
 }
 
@@ -217,13 +222,14 @@ static esp_err_t ws_handler(httpd_req_t *req)
     err = httpd_ws_recv_frame(req, &frame, frame.len);
     if (err == ESP_OK &&
         (frame.type == HTTPD_WS_TYPE_TEXT || frame.type == HTTPD_WS_TYPE_BINARY)) {
-        uart_tcp_bridge_write(buf, frame.len);
+        uart_tcp_bridge_write((int)(intptr_t)req->user_ctx, buf, frame.len);
     }
     free(buf);
     return err;
 }
 
 typedef struct {
+    int ch;
     size_t len;
     uint8_t data[];
 } ws_msg_t;
@@ -232,8 +238,10 @@ static void ws_send_work(void *arg)
 {
     ws_msg_t *m = arg;
     int fds[MAX_WS];
+    int chs[MAX_WS];
     portENTER_CRITICAL(&s_ws_mux);
     memcpy(fds, s_ws_fds, sizeof(fds));
+    memcpy(chs, s_ws_ch, sizeof(chs));
     portEXIT_CRITICAL(&s_ws_mux);
 
     httpd_ws_frame_t frame = {
@@ -243,7 +251,7 @@ static void ws_send_work(void *arg)
         .final = true,
     };
     for (int i = 0; i < MAX_WS; i++) {
-        if (fds[i] < 0) {
+        if (fds[i] < 0 || chs[i] != m->ch) {
             continue;
         }
         if (httpd_ws_get_fd_info(s_server, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) {
@@ -260,7 +268,7 @@ static void ws_send_work(void *arg)
 }
 
 /* UART reader task -> httpd task. Copies, so the reader never waits on a browser. */
-static void ws_tap(const uint8_t *data, size_t len)
+static void ws_tap(int ch, const uint8_t *data, size_t len)
 {
     if (s_ws_count == 0 || s_ws_queued + (int)len > WS_MAX_QUEUED) {
         return;
@@ -269,6 +277,7 @@ static void ws_tap(const uint8_t *data, size_t len)
     if (m == NULL) {
         return;
     }
+    m->ch = ch;
     m->len = len;
     memcpy(m->data, data, len);
     __atomic_fetch_add(&s_ws_queued, (int)len, __ATOMIC_RELAXED);
@@ -294,9 +303,9 @@ void web_start(void)
     xTaskCreate(cmd_worker, "cmd_worker", 6144, NULL, 4, NULL);
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_open_sockets = 6;
+    cfg.max_open_sockets = 7;
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 4;
+    cfg.max_uri_handlers = 5;
     cfg.stack_size = 4608;   /* handlers only parse and queue; commands run in cmd_worker */
     cfg.close_fn = on_close;
     cfg.keep_alive_enable = true;
@@ -313,18 +322,30 @@ void web_start(void)
     static const httpd_uri_t index_uri = { .uri = "/", .method = HTTP_GET, .handler = index_get };
     static const httpd_uri_t cmd_uri = { .uri = "/api/cmd", .method = HTTP_POST,
                                          .handler = api_cmd_post };
-    static const httpd_uri_t ws_uri = {
-        .uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true,
 #if CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
-        .ws_pre_handshake_cb = ws_pre_handshake,
+#define WS_PRE .ws_pre_handshake_cb = ws_pre_handshake,
+#else
+#define WS_PRE
 #endif
 #if CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
-        .ws_post_handshake_cb = ws_post_handshake,
+#define WS_POST .ws_post_handshake_cb = ws_post_handshake,
+#else
+#define WS_POST
 #endif
+    static const httpd_uri_t ws_mcu_uri = {
+        .uri = "/ws", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true,
+        .user_ctx = (void *)BRIDGE_CH_MCU, WS_PRE WS_POST
+    };
+    static const httpd_uri_t ws_soc_uri = {
+        .uri = "/ws/soc", .method = HTTP_GET, .handler = ws_handler, .is_websocket = true,
+        .user_ctx = (void *)BRIDGE_CH_SOC, WS_PRE WS_POST
     };
     httpd_register_uri_handler(s_server, &index_uri);
     httpd_register_uri_handler(s_server, &cmd_uri);
-    httpd_register_uri_handler(s_server, &ws_uri);
+    httpd_register_uri_handler(s_server, &ws_mcu_uri);
+    if (uart_tcp_bridge_enabled(BRIDGE_CH_SOC)) {
+        httpd_register_uri_handler(s_server, &ws_soc_uri);
+    }
 
     uart_tcp_bridge_add_tap(ws_tap);
     ESP_LOGI(TAG, "app: http://%s.local/  (setup AP: http://192.168.4.1/)", CONFIG_BRIDGE_HOSTNAME);

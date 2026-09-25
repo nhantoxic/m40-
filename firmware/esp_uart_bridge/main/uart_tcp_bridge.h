@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-/* Configure the SoC UART and, when enabled, the MCU UART, then start one TCP
+/* Configure the MCU UART and, when enabled, the SoC UART, then start one TCP
  * server per channel. Never returns an error to the caller: any fault is fatal
  * and asserted, because a half-started bridge is worse than a reboot loop you
  * can see. */
@@ -36,23 +36,30 @@ typedef struct {
     uint32_t buf_full;
 } uart_tcp_bridge_stats_t;
 
-/* index 0 is the primary channel, 1 the optional MCU channel. An index that is
- * not built into this firmware zeroes the output. */
-void uart_tcp_bridge_get_stats(int index, uart_tcp_bridge_stats_t *out);
+/* Channels. MCU is always present; SoC exists when CONFIG_BRIDGE_SOC_UART_ENABLE. */
+#define BRIDGE_CH_MCU    0   /* robot MCU UART, tcp/CONFIG_BRIDGE_TCP_PORT */
+#define BRIDGE_CH_SOC    1   /* robot SoC Linux shell, tcp/CONFIG_BRIDGE_SOC_TCP_PORT */
+#define BRIDGE_CH_COUNT  2
 
-/* Baud rate the primary channel is running at (saved setting, else
- * CONFIG_BRIDGE_UART_BAUD). */
-int uart_tcp_bridge_baud(void);
+bool uart_tcp_bridge_enabled(int ch);
+bool uart_tcp_bridge_channel_has_client(int ch);
+int uart_tcp_bridge_tcp_port(int ch);
 
-/* Changes the primary channel baud immediately (not persisted here). */
-esp_err_t uart_tcp_bridge_set_baud(int baud);
+/* Zeroes the output for a channel that is not built in. */
+void uart_tcp_bridge_get_stats(int ch, uart_tcp_bridge_stats_t *out);
 
-/* Writes to the primary UART from the app/command path. Returns bytes queued. */
-int uart_tcp_bridge_write(const uint8_t *data, size_t len);
+/* Baud rate the channel is running at (saved setting, else Kconfig default). */
+int uart_tcp_bridge_baud(int ch);
 
-/* Called from the UART reader task with every chunk received on the primary
- * channel, whether or not a TCP client is connected. Keep it short. */
-typedef void (*uart_tcp_bridge_tap_t)(const uint8_t *data, size_t len);
+/* Changes a channel's baud immediately (not persisted here). */
+esp_err_t uart_tcp_bridge_set_baud(int ch, int baud);
+
+/* Writes to a channel's UART from the app/command path. Returns bytes queued, -1 if absent. */
+int uart_tcp_bridge_write(int ch, const uint8_t *data, size_t len);
+
+/* Called from the UART reader tasks with every chunk received on any channel,
+ * whether or not a TCP client is connected. Keep it short. */
+typedef void (*uart_tcp_bridge_tap_t)(int ch, const uint8_t *data, size_t len);
 void uart_tcp_bridge_add_tap(uart_tcp_bridge_tap_t tap);
 
 #ifdef __cplusplus

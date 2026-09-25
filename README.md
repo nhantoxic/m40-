@@ -28,6 +28,8 @@ python tools\bridge_tool.py uart.xfer 800 "info -a\r\n"                 # gửi 
 python tools\bridge_tool.py --text uart.xfer 800 "info -a\r\n"          # chỉ in text phản hồi
 python tools\bridge_tool.py uart.read 500
 python tools\bridge_tool.py uart.sendhex "3C 00 01 3E"
+python tools\bridge_tool.py --text soc.xfer 1000 "uname -a\n"            # shell Linux của SoC (UART thứ 2)
+python tools\bridge_tool.py term --soc                                   # terminal raw tcp/2323 (SoC)
 python tools\bridge_tool.py swd ID
 python tools\bridge_tool.py swd READ 0x08000000 64
 python tools\bridge_tool.py help                                         # danh sách lệnh từ firmware

@@ -48,16 +48,21 @@ static const char *TAG = "main";
     CONFIG_BRIDGE_UART_TX_GPIO == CONFIG_BRIDGE_SWCLK_GPIO || \
     CONFIG_BRIDGE_UART_RX_GPIO == CONFIG_BRIDGE_SWDIO_GPIO || \
     CONFIG_BRIDGE_UART_RX_GPIO == CONFIG_BRIDGE_SWCLK_GPIO
-#error "Primary UART GPIOs overlap SWD; move the UART pins or disable SWD"
-#endif
-#if defined(CONFIG_BRIDGE_MCU_UART_ENABLE) && CONFIG_BRIDGE_MCU_UART_ENABLE
-#if CONFIG_BRIDGE_MCU_UART_TX_GPIO == CONFIG_BRIDGE_SWDIO_GPIO || \
-    CONFIG_BRIDGE_MCU_UART_TX_GPIO == CONFIG_BRIDGE_SWCLK_GPIO || \
-    CONFIG_BRIDGE_MCU_UART_RX_GPIO == CONFIG_BRIDGE_SWDIO_GPIO || \
-    CONFIG_BRIDGE_MCU_UART_RX_GPIO == CONFIG_BRIDGE_SWCLK_GPIO
 #error "MCU UART GPIOs overlap SWD; move the UART pins or disable SWD"
 #endif
+#if defined(CONFIG_BRIDGE_SOC_UART_ENABLE) && CONFIG_BRIDGE_SOC_UART_ENABLE
+#if CONFIG_BRIDGE_SOC_UART_TX_GPIO == CONFIG_BRIDGE_SWDIO_GPIO || \
+    CONFIG_BRIDGE_SOC_UART_TX_GPIO == CONFIG_BRIDGE_SWCLK_GPIO || \
+    CONFIG_BRIDGE_SOC_UART_RX_GPIO == CONFIG_BRIDGE_SWDIO_GPIO || \
+    CONFIG_BRIDGE_SOC_UART_RX_GPIO == CONFIG_BRIDGE_SWCLK_GPIO
+#error "SoC UART GPIOs overlap SWD; move the UART pins or disable SWD"
 #endif
+#endif
+#endif
+
+#if CONFIG_ESP_CONSOLE_UART && CONFIG_BRIDGE_SOC_UART_ENABLE && \
+    CONFIG_ESP_CONSOLE_UART_NUM == CONFIG_BRIDGE_SOC_UART_NUM
+#error "The SoC shell UART is also the console UART; change BRIDGE_SOC_UART_NUM or the console"
 #endif
 
 /* The USB console also carries "@CMD"/"@SWD" requests. USB-Serial-JTAG (S3)
@@ -70,7 +75,7 @@ static void console_input_init(void)
     if (usb_serial_jtag_driver_install(&cfg) == ESP_OK) {
         usb_serial_jtag_vfs_use_driver();
     }
-#elif CONFIG_ESP_CONSOLE_UART && !CONFIG_BRIDGE_MCU_UART_ENABLE
+#elif CONFIG_ESP_CONSOLE_UART
     if (uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 512, 0, 0, NULL, 0) == ESP_OK) {
         uart_vfs_dev_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
     }

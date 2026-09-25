@@ -70,6 +70,7 @@ table.cmds{width:100%;border-collapse:collapse;font-size:13px}table.cmds td{bord
 
 <section id="t-term">
   <div class="card">
+    <div class="row" style="margin:0 0 8px"><label>Cổng <select id="chan"><option value="mcu">MCU (UART · tcp 2324)</option><option value="soc">SoC shell (tcp 2323)</option></select></label><span class="muted" id="chanInfo"></span></div>
     <div id="log"></div>
     <div class="row">
       <input type="text" id="inp" class="grow" placeholder="Lệnh gửi xuống robot (↑/↓ lịch sử; \r \n \xHH)" autocomplete="off" autocapitalize="off" spellcheck="false">
@@ -134,7 +135,7 @@ const fmtB=n=>n>=1e6?(n/1e6).toFixed(2)+" MB":n>=1e3?(n/1e3).toFixed(1)+" kB":n+
 function kv(el,rows){el.innerHTML="";for(const[k,v]of rows){const a=document.createElement("span"),b=document.createElement("span");a.textContent=k;b.innerHTML=v;el.append(a,b)}}
 async function status(){
   let s;try{s=await cmd("status",5000)}catch(e){$("netPill").textContent="mất kết nối";return}
-  if(!s.ok)return;const w=s.wifi,u=s.uart;
+  if(!s.ok)return;const w=s.wifi,u=s.uart,sc=s.soc;last_status=s;
   $("netPill").textContent=w.connected?`${w.ssid} · ${w.ip} · ${w.rssi} dBm`:(w.setup_ap?`AP cài đặt: ${w.setup_ap_ssid}`:"chưa có Wi-Fi");
   $("apName").textContent=w.setup_ap_ssid;
   const now=Date.now();if(last){const dt=(now-last.t)/1000;$("ratePill").textContent=`↓${fmtB(Math.max(0,Math.round((u.rx_bytes-last.rx)/dt)))}/s ↑${fmtB(Math.max(0,Math.round((u.tx_bytes-last.tx)/dt)))}/s`}
@@ -144,10 +145,12 @@ async function status(){
     ["IP",w.connected?`${w.ip} · <a href="http://${esc(w.hostname)}/">${esc(w.hostname)}</a>`:"–"],
     ["Tín hiệu",w.connected?w.rssi+" dBm":"–"],
     ["AP cài đặt",w.setup_ap?`<b>bật</b> ${esc(w.setup_ap_ssid)} (${w.setup_ap_clients} thiết bị) · 192.168.4.1`:"tắt"],
-    ["UART",`${u.baud} ${u.mode} · TCP ${u.tcp_port}${u.tcp_client?" (đang có client)":""}`],
-    ["Bộ đếm",`nhận ${fmtB(u.rx_bytes)} · gửi ${fmtB(u.tx_bytes)} · lỗi frame ${u.frame_err} · parity ${u.parity_err} · tràn ${u.fifo_ovf+u.buf_full}`],
+    ["UART MCU",`${u.baud} ${u.mode} · TCP ${u.tcp_port}${u.tcp_client?" (đang có client)":""}`],
+    ["Bộ đếm MCU",`nhận ${fmtB(u.rx_bytes)} · gửi ${fmtB(u.tx_bytes)} · lỗi frame ${u.frame_err} · parity ${u.parity_err} · tràn ${u.fifo_ovf+u.buf_full}`],
+    ...(sc?[["UART SoC",`${sc.baud} ${sc.mode} · TCP ${sc.tcp_port}${sc.tcp_client?" (đang có client)":""}`],
+    ["Bộ đếm SoC",`nhận ${fmtB(sc.rx_bytes)} · gửi ${fmtB(sc.tx_bytes)} · lỗi frame ${sc.frame_err} · parity ${sc.parity_err} · tràn ${sc.fifo_ovf+sc.buf_full}`]]:[]),
     ["Firmware",`${esc(s.fw)} · uptime ${Math.floor(s.uptime_s/60)} phút · heap ${fmtB(s.free_heap)}`]]);
-  if(first){first=false;setBaud(u.baud);if(!w.connected)tab("wifi")}
+  if(first){first=false;if(!sc){$("chan").querySelector("[value=soc]").remove();if(chan=="soc")switchChan("mcu")}setBaud((chan=="soc"&&sc?sc:u).baud);if(!w.connected)tab("wifi")}
 }
 setInterval(()=>{if(!document.hidden)status()},3000);
 
@@ -191,10 +194,11 @@ function rx(bytes){
   s.split("\n").forEach((p,i,parts)=>{if(i>0)lineOpen=false;if(p===""&&i==parts.length-1)return;
     if(lineOpen&&cur){cur.lastChild.textContent+=p;logText[logText.length-1]+=p}else{cur=addLine("",p);lineOpen=true}});trim()}
 function sys(t){addLine("sys","# "+t);lineOpen=false;trim()}
-let ws=null,wsOk=false;
-function connect(){ws=new WebSocket(`ws://${location.host}/ws`);ws.binaryType="arraybuffer";
-  ws.onopen=()=>{wsOk=true;$("wsPill").classList.add("on");$("wsTxt").textContent="terminal";sys("đã kết nối terminal")};
-  ws.onclose=()=>{if(wsOk)sys("mất kết nối terminal, đang thử lại…");wsOk=false;$("wsPill").classList.remove("on");$("wsTxt").textContent="offline";setTimeout(connect,1500)};
+let ws=null,wsOk=false,wsGen=0,last_status=null,chan=store.get("chan","mcu");
+const CHAN_NAME={mcu:"MCU",soc:"SoC shell"},CHAN_CMD={mcu:"uart",soc:"soc"};
+function connect(){const gen=++wsGen;ws=new WebSocket(`ws://${location.host}/ws${chan=="soc"?"/soc":""}`);ws.binaryType="arraybuffer";
+  ws.onopen=()=>{if(gen!=wsGen)return;wsOk=true;$("wsPill").classList.add("on");$("wsTxt").textContent=CHAN_NAME[chan];sys("đã kết nối terminal "+CHAN_NAME[chan])};
+  ws.onclose=()=>{if(gen!=wsGen)return;if(wsOk)sys("mất kết nối terminal, đang thử lại…");wsOk=false;$("wsPill").classList.remove("on");$("wsTxt").textContent="offline";setTimeout(()=>{if(gen==wsGen)connect()},1500)};
   ws.onmessage=e=>rx(new Uint8Array(typeof e.data=="string"?enc.encode(e.data):e.data))}
 function unesc(s){const out=[];for(let i=0;i<s.length;i++){let c=s[i];if(c=="\\"&&i+1<s.length){const n=s[i+1];
   if(n=="x"&&/^[0-9a-fA-F]{2}$/.test(s.substr(i+2,2))){out.push(parseInt(s.substr(i+2,2),16));i+=3;continue}
@@ -213,10 +217,18 @@ $("saveLog").onclick=()=>{const a=document.createElement("a");a.href=URL.createO
 ["view","ts","echo","auto","eol","hexIn"].forEach(k=>{const el=$(k),v=store.get("ui."+k,null);if(v!=null){if(el.type=="checkbox")el.checked=v;else el.value=v}el.onchange=()=>store.set("ui."+k,el.type=="checkbox"?el.checked:el.value)});
 const BAUDS=[9600,19200,38400,57600,115200,460800,921600,1000000,2000000];
 function setBaud(b){const sel=$("baud");sel.innerHTML="";const list=BAUDS.includes(b)?BAUDS:[...BAUDS,b].sort((x,y)=>x-y);for(const r of list){const o=document.createElement("option");o.value=o.textContent=r;sel.appendChild(o)}sel.value=b}
-$("baud").onchange=async()=>{const r=await cmd("uart.baud "+$("baud").value);sys(r.ok?"baud = "+r.baud:"lỗi: "+r.error)};
-let macros=store.get("macros",[["info","info -a"],["version","ver -t"],["help","help"]]);
+$("baud").onchange=async()=>{const r=await cmd(CHAN_CMD[chan]+".baud "+$("baud").value);sys(r.ok?CHAN_NAME[chan]+" baud = "+r.baud:"lỗi: "+r.error)};
+function switchChan(c){chan=c;store.set("chan",c);$("chan").value=c;wsOk=false;wsGen++;try{ws&&ws.close()}catch(e){}
+  lineOpen=false;sys("chuyển sang "+CHAN_NAME[c]);connect();
+  const st=last_status&&(c=="soc"?last_status.soc:last_status.uart);if(st)setBaud(st.baud);
+  const e=store.get("ui.eol."+c,null);if(e!=null)$("eol").value=e;
+  macros=store.get("macros."+c,store.get(c=="mcu"?"macros":"_",DEFAULT_MACROS[c]));drawMacros()}
+$("chan").onchange=()=>switchChan($("chan").value);
+$("eol").addEventListener("change",()=>store.set("ui.eol."+chan,$("eol").value));
+const DEFAULT_MACROS={mcu:[["info","info -a"],["version","ver -t"],["help","help"]],soc:[["uname","uname -a"],["uptime","uptime"],["ps","ps"],["dmesg","dmesg | tail -n 30"],["Ctrl+C","\\x03"]]};
+let macros=store.get("macros."+chan,store.get(chan=="mcu"?"macros":"_",DEFAULT_MACROS[chan]));
 function drawMacros(){$("macros").innerHTML="";for(const[n,c]of macros){const b=document.createElement("button");b.textContent=n;b.title=c;b.onclick=()=>sendText(c,n+": "+c);$("macros").appendChild(b)}$("macroTxt").value=macros.map(m=>m[0]+" = "+m[1]).join("\n")}
-$("macroSave").onclick=()=>{macros=$("macroTxt").value.split("\n").map(l=>{const i=l.indexOf("=");return i<0?null:[l.slice(0,i).trim(),l.slice(i+1).trim()]}).filter(m=>m&&m[0]);store.set("macros",macros);drawMacros()};
+$("macroSave").onclick=()=>{macros=$("macroTxt").value.split("\n").map(l=>{const i=l.indexOf("=");return i<0?null:[l.slice(0,i).trim(),l.slice(i+1).trim()]}).filter(m=>m&&m[0]);store.set("macros."+chan,macros);drawMacros()};
 drawMacros();
 
 /* ---------- commands ---------- */
@@ -237,6 +249,7 @@ for(const c of["PING","ID","DPID","PID","CTRL","HALT","RESUME","STEP"]){const b=
 $("rdBtn").onclick=()=>swd(`READ ${$("rdAddr").value} ${$("rdLen").value}`);
 $("swdRun").onclick=()=>{const v=$("swdLine").value.trim();if(v)swd(v)};$("swdLine").onkeydown=e=>{if(e.key=="Enter")$("swdRun").click()};
 
+$("chan").value=chan;{const e=store.get("ui.eol."+chan,null);if(e!=null)$("eol").value=e}
 tab(store.get("tab","term"));connect();status();
 </script>
 </body>

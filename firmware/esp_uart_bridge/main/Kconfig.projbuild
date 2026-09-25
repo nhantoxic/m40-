@@ -55,36 +55,32 @@ config BRIDGE_DISCOVERY_PORT
         UDP port used by the RobotMonitor discovery request and response.
 
 config BRIDGE_TCP_PORT
-    int "TCP port for the primary UART (SoC in dual-UART mode)"
-    default 2323
+    int "TCP port for the MCU UART"
+    default 2324
 
 config BRIDGE_UART_TX_GPIO
-    int "GPIO that drives the primary UART peer RX line"
-    default 16
+    int "GPIO that drives the MCU UART RX line (ESP TX)"
+    default 35
     help
-        GPIO16 is the default peer-TX pin in dual-UART profiles. The temporary
-        UART-only profile overrides this to GPIO35. This is ESP-side routing;
-        it does not identify which robot-side UART is connected. Put a 1 kohm
-        resistor in series after verifying the robot pin.
+        LOLIN S2 mini: GPIO35 (ESP32-S3 defaults are in
+        sdkconfig.defaults.esp32s3). Put 1 kohm in series once the robot pin
+        is verified.
 
 config BRIDGE_UART_RX_GPIO
-    int "GPIO that listens to the primary UART peer TX line"
-    default 18
+    int "GPIO that listens to the MCU UART TX line (ESP RX)"
+    default 33
     help
-        GPIO18 is the default peer-RX pin in dual-UART profiles. The temporary
-        UART-only profile overrides this to GPIO33. This is ESP-side routing;
-        it does not identify which robot-side UART is connected. Also use
-        1 kohm in series after verifying the robot pin.
+        LOLIN S2 mini: GPIO33.
 
 config BRIDGE_UART_BAUD
-    int "Default UART baud rate"
+    int "Default MCU UART baud rate"
     default 115200
     help
         Used until a rate is set at runtime ("uart.baud <rate>"), which is
         saved in NVS and takes priority.
 
 config BRIDGE_UART_AUTOBAUD
-    bool "Probe several baud rates on the primary UART at boot"
+    bool "Probe several baud rates on the MCU UART at boot"
     default n
     help
         Runs 115200/57600/9600 in turn, sends a line feed and "info -a"
@@ -121,51 +117,58 @@ config BRIDGE_UART_SW_FLOWCTRL
         confirming that the robot honours XON/XOFF. It is disabled by default
         because an unsupported peer could treat these bytes as console input.
 
-config BRIDGE_MCU_UART_ENABLE
-    bool "Enable the MCU ARM UART bridge"
+config BRIDGE_SOC_UART_ENABLE
+    bool "Enable the SoC shell UART (second channel)"
     default y
     help
-        Expose a second UART channel on a TCP port. The selected robot-side
-        pins must be verified as the MCU UART before labeling or using this
-        channel as the MCU command/update path. UART0 is used here because the
-        ESP console is on native USB CDC, not on a UART pin.
+        Second UART channel for the robot SoC's Linux shell, on UART0 (free
+        because the ESP console is on native USB). Exposed on its own TCP
+        port, in the web app terminal and through the soc.* commands.
 
-config BRIDGE_MCU_TCP_PORT
-    int "TCP port assigned to the MCU ARM UART channel"
-    default 2324
-
-config BRIDGE_MCU_UART_TX_GPIO
-    int "GPIO that drives the MCU UART RX line"
-    default 35
+config BRIDGE_SOC_UART_NUM
+    int "UART peripheral for the SoC shell"
+    depends on BRIDGE_SOC_UART_ENABLE
+    range 0 2
+    default 0
     help
-        LOLIN S2 mini connector-row default: GPIO35 (ESP TX). Connect it to
-        MCU RX only after tracing the robot-side signal. GPIO16/18 are reserved
-        for SWDIO/SWCLK.
+        0 on the ESP32-S2 (UART1 carries the MCU channel). The ESP32-S3 uses
+        UART2 so UART0 stays available as a console.
 
-config BRIDGE_MCU_UART_RX_GPIO
-    int "GPIO that listens to the MCU UART TX line"
-    default 33
+config BRIDGE_SOC_TCP_PORT
+    int "TCP port for the SoC shell UART"
+    depends on BRIDGE_SOC_UART_ENABLE
+    default 2323
+
+config BRIDGE_SOC_UART_TX_GPIO
+    int "GPIO that drives the SoC UART RX line (ESP TX)"
+    depends on BRIDGE_SOC_UART_ENABLE
+    default 37
     help
-        LOLIN S2 mini connector-row default: GPIO33 (ESP RX). Connect it to
-        MCU TX only after tracing the robot-side signal. GPIO16/18 are reserved
-        for SWDIO/SWCLK.
+        LOLIN S2 mini: GPIO37. Put 1 kohm in series once the robot pin is
+        verified.
 
-config BRIDGE_MCU_UART_BAUD
-    int "MCU UART baud rate"
+config BRIDGE_SOC_UART_RX_GPIO
+    int "GPIO that listens to the SoC UART TX line (ESP RX)"
+    depends on BRIDGE_SOC_UART_ENABLE
+    default 39
+    help
+        LOLIN S2 mini: GPIO39.
+
+config BRIDGE_SOC_UART_BAUD
+    int "Default SoC UART baud rate"
+    depends on BRIDGE_SOC_UART_ENABLE
     default 115200
     help
-        This is a configured rate only. Verify the current MCU image and
-        physical command UART before treating it as the MCU CLI baud.
+        Used until a rate is set at runtime ("soc.baud <rate>").
 
-config BRIDGE_MCU_UART_EVEN_PARITY
-    bool "MCU UART even parity"
+config BRIDGE_SOC_UART_EVEN_PARITY
+    bool "SoC UART even parity"
+    depends on BRIDGE_SOC_UART_ENABLE
     default n
-    help
-        Older X40/MR813 reference firmware was analyzed as 8N1. Verify the
-        live image and command UART before relying on that assumption.
 
-config BRIDGE_MCU_UART_RX_BUF
-    int "MCU UART driver RX ring buffer (bytes)"
+config BRIDGE_SOC_UART_RX_BUF
+    int "SoC UART driver RX ring buffer (bytes)"
+    depends on BRIDGE_SOC_UART_ENABLE
     default 8192
 
 config BRIDGE_LED_GPIO
@@ -200,7 +203,7 @@ config BRIDGE_MDNS_ENABLE
     help
         Lets tools reach the bridge as dreame-bridge.local instead of a DHCP
         address that changes. Also advertises _dreame-bridge._tcp for the
-        primary UART port. Requires the espressif/mdns managed component
+        MCU UART port. Requires the espressif/mdns managed component
         (fetched automatically on the first build).
 
 config BRIDGE_SWD_ENABLE

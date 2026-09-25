@@ -37,61 +37,82 @@ static const char *TAG = "cmd";
 
 /* ------------------------------------------------------------ UART capture */
 
-static uint8_t s_cap[CAP_SIZE];
-static size_t s_cap_head;
-static size_t s_cap_len;
-static bool s_cap_overflow;
-static SemaphoreHandle_t s_cap_lock;
-static SemaphoreHandle_t s_xfer_lock;   /* one uart.read/xfer at a time */
-static EventGroupHandle_t s_cap_ev;
+/* One capture buffer per UART channel (MCU, SoC shell). */
+typedef struct {
+    uint8_t buf[CAP_SIZE];
+    size_t head;
+    size_t len;
+    bool overflow;
+    SemaphoreHandle_t lock;
+    SemaphoreHandle_t xfer_lock;   /* one read/xfer at a time */
+    EventGroupHandle_t ev;
+} capture_t;
 
-static void cap_tap(const uint8_t *data, size_t len)
+static capture_t s_cap[BRIDGE_CH_COUNT];
+
+/* Command prefix per channel: uart.* talks to the MCU, soc.* to the SoC shell. */
+static const char *const CH_PREFIX[BRIDGE_CH_COUNT] = { "uart", "soc" };
+
+static void cap_tap(int ch, const uint8_t *data, size_t len)
 {
-    xSemaphoreTake(s_cap_lock, portMAX_DELAY);
+    if (ch < 0 || ch >= BRIDGE_CH_COUNT) {
+        return;
+    }
+    capture_t *c = &s_cap[ch];
+    xSemaphoreTake(c->lock, portMAX_DELAY);
     for (size_t i = 0; i < len; i++) {
-        s_cap[(s_cap_head + s_cap_len) % CAP_SIZE] = data[i];
-        if (s_cap_len < CAP_SIZE) {
-            s_cap_len++;
+        c->buf[(c->head + c->len) % CAP_SIZE] = data[i];
+        if (c->len < CAP_SIZE) {
+            c->len++;
         } else {
-            s_cap_head = (s_cap_head + 1) % CAP_SIZE;
-            s_cap_overflow = true;
+            c->head = (c->head + 1) % CAP_SIZE;
+            c->overflow = true;
         }
     }
-    xSemaphoreGive(s_cap_lock);
-    xEventGroupSetBits(s_cap_ev, CAP_BIT);
+    xSemaphoreGive(c->lock);
+    xEventGroupSetBits(c->ev, CAP_BIT);
 }
 
-static size_t cap_len(void)
+static size_t cap_len(capture_t *c)
 {
-    xSemaphoreTake(s_cap_lock, portMAX_DELAY);
-    size_t n = s_cap_len;
-    xSemaphoreGive(s_cap_lock);
+    xSemaphoreTake(c->lock, portMAX_DELAY);
+    size_t n = c->len;
+    xSemaphoreGive(c->lock);
     return n;
 }
 
-static size_t cap_take(uint8_t *out, bool *overflow)
+static void cap_clear(capture_t *c)
 {
-    xSemaphoreTake(s_cap_lock, portMAX_DELAY);
-    size_t n = s_cap_len;
+    xSemaphoreTake(c->lock, portMAX_DELAY);
+    c->head = 0;
+    c->len = 0;
+    c->overflow = false;
+    xSemaphoreGive(c->lock);
+}
+
+static size_t cap_take(capture_t *c, uint8_t *out, bool *overflow)
+{
+    xSemaphoreTake(c->lock, portMAX_DELAY);
+    size_t n = c->len;
     for (size_t i = 0; i < n; i++) {
-        out[i] = s_cap[(s_cap_head + i) % CAP_SIZE];
+        out[i] = c->buf[(c->head + i) % CAP_SIZE];
     }
-    s_cap_head = 0;
-    s_cap_len = 0;
-    *overflow = s_cap_overflow;
-    s_cap_overflow = false;
-    xSemaphoreGive(s_cap_lock);
+    c->head = 0;
+    c->len = 0;
+    *overflow = c->overflow;
+    c->overflow = false;
+    xSemaphoreGive(c->lock);
     return n;
 }
 
 /* Waits up to wait_ms for data, then until the line has been quiet for idle_ms. */
-static void cap_wait(uint32_t wait_ms, uint32_t idle_ms)
+static void cap_wait(capture_t *c, uint32_t wait_ms, uint32_t idle_ms)
 {
     const int64_t deadline = esp_timer_get_time() + (int64_t)wait_ms * 1000;
     bool got = false;
     for (;;) {
-        xEventGroupClearBits(s_cap_ev, CAP_BIT);
-        if (!got && cap_len() > 0) {
+        xEventGroupClearBits(c->ev, CAP_BIT);
+        if (!got && cap_len(c) > 0) {
             got = true;
         }
         int64_t left_ms = (deadline - esp_timer_get_time()) / 1000;
@@ -99,7 +120,7 @@ static void cap_wait(uint32_t wait_ms, uint32_t idle_ms)
             return;
         }
         uint32_t step = got ? (idle_ms < left_ms ? idle_ms : (uint32_t)left_ms) : (uint32_t)left_ms;
-        EventBits_t bits = xEventGroupWaitBits(s_cap_ev, CAP_BIT, pdTRUE, pdFALSE,
+        EventBits_t bits = xEventGroupWaitBits(c->ev, CAP_BIT, pdTRUE, pdFALSE,
                                                pdMS_TO_TICKS(step));
         if (bits & CAP_BIT) {
             got = true;
@@ -257,12 +278,15 @@ static void put_data(jbuf_t *jb, const uint8_t *data, size_t len)
 }
 
 typedef bool (*cmd_fn_t)(jbuf_t *jb, const char *args);
+typedef bool (*cmd_ch_fn_t)(jbuf_t *jb, const char *args, int ch);
 
 typedef struct {
     const char *name;
     const char *usage;
     const char *help;
     cmd_fn_t fn;
+    cmd_ch_fn_t ch_fn;   /* UART commands: called with the channel */
+    int ch;
 } cmd_t;
 
 static const cmd_t *commands(size_t *count);
@@ -289,8 +313,6 @@ static bool c_status(jbuf_t *jb, const char *args)
 {
     (void)args;
     const esp_app_desc_t *app = esp_app_get_description();
-    uart_tcp_bridge_stats_t st;
-    uart_tcp_bridge_get_stats(0, &st);
 
     jb_bool(jb, "ok", true);
     jb_str(jb, "fw", app->version);
@@ -300,20 +322,28 @@ static bool c_status(jbuf_t *jb, const char *args)
     jb_obj_open(jb, "wifi");
     wifi_mgr_status_json(jb);
     jb_obj_close(jb);
-    jb_obj_open(jb, "uart");
-    jb_int(jb, "baud", uart_tcp_bridge_baud());
-    jb_str(jb, "mode", "8N1");
-    jb_int(jb, "tcp_port", CONFIG_BRIDGE_TCP_PORT);
-    jb_bool(jb, "tcp_client", uart_tcp_bridge_has_client());
-    jb_int(jb, "rx_bytes", st.rx_bytes);
-    jb_int(jb, "tx_bytes", st.tx_bytes);
-    jb_int(jb, "frame_err", st.frame_err);
-    jb_int(jb, "parity_err", st.parity_err);
-    jb_int(jb, "break", st.break_evt);
-    jb_int(jb, "fifo_ovf", st.fifo_ovf);
-    jb_int(jb, "buf_full", st.buf_full);
-    jb_int(jb, "buffered", (long long)cap_len());
-    jb_obj_close(jb);
+    /* "uart" = robot MCU, "soc" = robot SoC shell (absent when disabled). */
+    for (int ch = 0; ch < BRIDGE_CH_COUNT; ch++) {
+        if (!uart_tcp_bridge_enabled(ch)) {
+            continue;
+        }
+        uart_tcp_bridge_stats_t st;
+        uart_tcp_bridge_get_stats(ch, &st);
+        jb_obj_open(jb, CH_PREFIX[ch]);
+        jb_int(jb, "baud", uart_tcp_bridge_baud(ch));
+        jb_str(jb, "mode", "8N1");
+        jb_int(jb, "tcp_port", uart_tcp_bridge_tcp_port(ch));
+        jb_bool(jb, "tcp_client", uart_tcp_bridge_channel_has_client(ch));
+        jb_int(jb, "rx_bytes", st.rx_bytes);
+        jb_int(jb, "tx_bytes", st.tx_bytes);
+        jb_int(jb, "frame_err", st.frame_err);
+        jb_int(jb, "parity_err", st.parity_err);
+        jb_int(jb, "break", st.break_evt);
+        jb_int(jb, "fifo_ovf", st.fifo_ovf);
+        jb_int(jb, "buf_full", st.buf_full);
+        jb_int(jb, "buffered", (long long)cap_len(&s_cap[ch]));
+        jb_obj_close(jb);
+    }
     jb_obj_open(jb, "swd");
     jb_bool(jb, "enabled", CONFIG_BRIDGE_SWD_ENABLE);
     jb_int(jb, "tcp_port", CONFIG_BRIDGE_SWD_TCP_PORT);
@@ -377,7 +407,7 @@ static bool c_wifi_ap(jbuf_t *jb, const char *args)
     return true;
 }
 
-static bool c_uart_baud(jbuf_t *jb, const char *args)
+static bool c_uart_baud(jbuf_t *jb, const char *args, int ch)
 {
     char arg[12];
     next_token(args, arg, sizeof(arg));
@@ -386,22 +416,22 @@ static bool c_uart_baud(jbuf_t *jb, const char *args)
         if (!parse_uint(arg, 5000000, &baud) || baud < 1200) {
             return fail(jb, "baud must be 1200..5000000");
         }
-        if (uart_tcp_bridge_set_baud((int)baud) != ESP_OK ||
-            settings_set_uart_baud((int)baud) != ESP_OK) {
+        if (uart_tcp_bridge_set_baud(ch, (int)baud) != ESP_OK ||
+            settings_set_uart_baud(ch, (int)baud) != ESP_OK) {
             return fail(jb, "could not apply/save baud rate");
         }
     }
     jb_bool(jb, "ok", true);
-    jb_int(jb, "baud", uart_tcp_bridge_baud());
+    jb_int(jb, "baud", uart_tcp_bridge_baud(ch));
     return true;
 }
 
-static bool send_bytes(jbuf_t *jb, const uint8_t *data, size_t len)
+static bool send_bytes(jbuf_t *jb, int ch, const uint8_t *data, size_t len)
 {
     if (len == 0) {
         return fail(jb, "nothing to send");
     }
-    int n = uart_tcp_bridge_write(data, len);
+    int n = uart_tcp_bridge_write(ch, data, len);
     if (n < 0) {
         return fail(jb, "uart write failed");
     }
@@ -410,30 +440,30 @@ static bool send_bytes(jbuf_t *jb, const uint8_t *data, size_t len)
     return true;
 }
 
-static bool c_uart_send(jbuf_t *jb, const char *args)
+static bool c_uart_send(jbuf_t *jb, const char *args, int ch)
 {
     uint8_t buf[MAX_DATA];
-    return send_bytes(jb, buf, parse_data(args, buf, sizeof(buf)));
+    return send_bytes(jb, ch, buf, parse_data(args, buf, sizeof(buf)));
 }
 
-static bool c_uart_sendhex(jbuf_t *jb, const char *args)
+static bool c_uart_sendhex(jbuf_t *jb, const char *args, int ch)
 {
     uint8_t buf[MAX_DATA];
     int n = parse_hex(args, buf, sizeof(buf));
     if (n < 0) {
         return fail(jb, "bad hex (odd digit count or longer than 1024 bytes)");
     }
-    return send_bytes(jb, buf, (size_t)n);
+    return send_bytes(jb, ch, buf, (size_t)n);
 }
 
-static bool reply_captured(jbuf_t *jb)
+static bool reply_captured(jbuf_t *jb, capture_t *c)
 {
     uint8_t *buf = malloc(CAP_SIZE);
     if (buf == NULL) {
         return fail(jb, "out of memory");
     }
     bool overflow;
-    size_t n = cap_take(buf, &overflow);
+    size_t n = cap_take(c, buf, &overflow);
     jb_bool(jb, "ok", true);
     put_data(jb, buf, n);
     jb_bool(jb, "overflow", overflow);
@@ -441,30 +471,31 @@ static bool reply_captured(jbuf_t *jb)
     return true;
 }
 
-static bool c_uart_read(jbuf_t *jb, const char *args)
+static bool c_uart_read(jbuf_t *jb, const char *args, int ch)
 {
     char arg[12];
     next_token(args, arg, sizeof(arg));
     unsigned long wait = 0;
     if (arg[0] != '\0' && !parse_uint(arg, MAX_WAIT_MS, &wait)) {
-        return fail(jb, "usage: uart.read [wait_ms<=30000]");
+        return fail(jb, "usage: <uart|soc>.read [wait_ms<=30000]");
     }
-    xSemaphoreTake(s_xfer_lock, portMAX_DELAY);
+    capture_t *c = &s_cap[ch];
+    xSemaphoreTake(c->xfer_lock, portMAX_DELAY);
     if (wait > 0) {
-        cap_wait(wait, READ_IDLE_MS);
+        cap_wait(c, wait, READ_IDLE_MS);
     }
-    bool ok = reply_captured(jb);
-    xSemaphoreGive(s_xfer_lock);
+    bool ok = reply_captured(jb, c);
+    xSemaphoreGive(c->xfer_lock);
     return ok;
 }
 
-static bool c_uart_xfer(jbuf_t *jb, const char *args)
+static bool c_uart_xfer(jbuf_t *jb, const char *args, int ch)
 {
     char arg[12];
     const char *rest = next_token(args, arg, sizeof(arg));
     unsigned long wait;
     if (!parse_uint(arg, MAX_WAIT_MS, &wait)) {
-        return fail(jb, "usage: uart.xfer <wait_ms<=30000> <data>");
+        return fail(jb, "usage: <uart|soc>.xfer <wait_ms<=30000> <data>");
     }
     uint8_t buf[MAX_DATA];
     size_t len = parse_data(rest, buf, sizeof(buf));
@@ -472,23 +503,20 @@ static bool c_uart_xfer(jbuf_t *jb, const char *args)
         return fail(jb, "nothing to send");
     }
 
-    xSemaphoreTake(s_xfer_lock, portMAX_DELAY);
-    xSemaphoreTake(s_cap_lock, portMAX_DELAY);   /* drop stale bytes */
-    s_cap_head = 0;
-    s_cap_len = 0;
-    s_cap_overflow = false;
-    xSemaphoreGive(s_cap_lock);
+    capture_t *c = &s_cap[ch];
+    xSemaphoreTake(c->xfer_lock, portMAX_DELAY);
+    cap_clear(c);   /* drop stale bytes */
 
-    int n = uart_tcp_bridge_write(buf, len);
+    int n = uart_tcp_bridge_write(ch, buf, len);
     bool ok;
     if (n < 0) {
         ok = fail(jb, "uart write failed");
     } else {
-        cap_wait(wait, XFER_IDLE_MS);
+        cap_wait(c, wait, XFER_IDLE_MS);
         jb_int(jb, "sent", n);
-        ok = reply_captured(jb);
+        ok = reply_captured(jb, c);
     }
-    xSemaphoreGive(s_xfer_lock);
+    xSemaphoreGive(c->xfer_lock);
     return ok;
 }
 
@@ -563,28 +591,34 @@ static bool c_reboot(jbuf_t *jb, const char *args)
 }
 
 static const cmd_t COMMANDS[] = {
-    { "help", "", "list commands", c_help },
-    { "status", "", "firmware, Wi-Fi, UART counters, SWD ports", c_status },
-    { "wifi.scan", "", "list visible networks (strongest first)", c_wifi_scan },
+    { "help", "", "list commands", c_help, NULL, 0 },
+    { "status", "", "firmware, Wi-Fi, UART counters, SWD ports", c_status, NULL, 0 },
+    { "wifi.scan", "", "list visible networks (strongest first)", c_wifi_scan, NULL, 0 },
     { "wifi.set", "<ssid> <password>",
       "join a network; saved only if it gets an IP, else the old one is kept. Quote values with spaces",
-      c_wifi_set },
-    { "wifi.forget", "", "erase the saved network and start the setup AP", c_wifi_forget },
-    { "wifi.ap", "on|off", "setup AP on (10 min) / off (only while connected)", c_wifi_ap },
-    { "uart.baud", "[rate]", "show or set (and save) the robot UART baud rate", c_uart_baud },
-    { "uart.send", "<data>", "send text; escapes \\r \\n \\t \\0 \\\\ \\\" \\xHH; no line ending is added",
-      c_uart_send },
-    { "uart.sendhex", "<hex>", "send raw bytes, e.g. 3C 00 01 3E", c_uart_sendhex },
-    { "uart.read", "[wait_ms]",
-      "return bytes received since the last read/xfer (buffer: 4 KB on S2, 16 KB on S3); wait up to wait_ms for data",
-      c_uart_read },
-    { "uart.xfer", "<wait_ms> <data>",
-      "clear the buffer, send data, return the reply (ends after 100 ms of silence or wait_ms)",
-      c_uart_xfer },
+      c_wifi_set, NULL, 0 },
+    { "wifi.forget", "", "erase the saved network and start the setup AP", c_wifi_forget, NULL, 0 },
+    { "wifi.ap", "on|off", "setup AP on (10 min) / off (only while connected)", c_wifi_ap, NULL, 0 },
+#define UART_COMMANDS(P, CH, WHAT)                                                              \
+    { P ".baud", "[rate]", "show or set (and save) the " WHAT " UART baud rate", NULL, c_uart_baud, CH }, \
+    { P ".send", "<data>", "send text to the " WHAT "; escapes \\r \\n \\t \\0 \\\\ \\\" \\xHH; no line ending is added", \
+      NULL, c_uart_send, CH },                                                                  \
+    { P ".sendhex", "<hex>", "send raw bytes to the " WHAT ", e.g. 3C 00 01 3E", NULL, c_uart_sendhex, CH }, \
+    { P ".read", "[wait_ms]",                                                                    \
+      "bytes received from the " WHAT " since the last read/xfer (buffer: 4 KB on S2, 16 KB on S3); wait up to wait_ms", \
+      NULL, c_uart_read, CH },                                                                  \
+    { P ".xfer", "<wait_ms> <data>",                                                             \
+      "send to the " WHAT " and return the reply (ends after 100 ms of silence or wait_ms)",     \
+      NULL, c_uart_xfer, CH }
+
+    UART_COMMANDS("uart", BRIDGE_CH_MCU, "robot MCU"),
+#if CONFIG_BRIDGE_SOC_UART_ENABLE
+    UART_COMMANDS("soc", BRIDGE_CH_SOC, "robot SoC shell"),
+#endif
     { "swd", "<command>",
       "SWD text command: PING ID DPID PID CTRL RAW HALT RESUME STEP REGREAD n REGWRITE n v RUNUNTIL ... READ addr len",
-      c_swd },
-    { "reboot", "", "restart the bridge", c_reboot },
+      c_swd, NULL, 0 },
+    { "reboot", "", "restart the bridge", c_reboot, NULL, 0 },
 };
 
 static const cmd_t *commands(size_t *count)
@@ -613,6 +647,8 @@ char *cmd_exec(const char *line)
     }
     if (c == NULL) {
         fail(&jb, name[0] ? "unknown command, try \"help\"" : "empty command");
+    } else if (c->ch_fn != NULL) {
+        c->ch_fn(&jb, args, c->ch);
     } else {
         c->fn(&jb, args);
     }
@@ -658,10 +694,12 @@ static void usb_task(void *arg)
 
 void cmd_start(void)
 {
-    s_cap_lock = xSemaphoreCreateMutex();
-    s_xfer_lock = xSemaphoreCreateMutex();
-    s_cap_ev = xEventGroupCreate();
-    assert(s_cap_lock && s_xfer_lock && s_cap_ev);
+    for (int ch = 0; ch < BRIDGE_CH_COUNT; ch++) {
+        s_cap[ch].lock = xSemaphoreCreateMutex();
+        s_cap[ch].xfer_lock = xSemaphoreCreateMutex();
+        s_cap[ch].ev = xEventGroupCreate();
+        assert(s_cap[ch].lock && s_cap[ch].xfer_lock && s_cap[ch].ev);
+    }
     uart_tcp_bridge_add_tap(cap_tap);
 #if !CONFIG_BRIDGE_SWD_ENABLE
     xTaskCreate(usb_task, "usb_cmd", 4096, NULL, 3, NULL);

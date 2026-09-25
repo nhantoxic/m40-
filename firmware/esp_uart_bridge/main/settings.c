@@ -11,11 +11,17 @@ static const char *TAG = "settings";
 #define KEY_SSID    "wifi_ssid"
 #define KEY_PASS    "wifi_pass"
 #define KEY_BAUD    "uart_baud"
+#define KEY_SOC_BAUD "soc_baud"
+
+#ifndef CONFIG_BRIDGE_SOC_UART_BAUD
+#define CONFIG_BRIDGE_SOC_UART_BAUD 115200
+#endif
 
 static char s_ssid[33];
 static char s_pass[65];
 static bool s_wifi_saved;   /* NVS holds a value, possibly "" (= forgotten) */
-static int s_baud = CONFIG_BRIDGE_UART_BAUD;
+static int s_baud[2] = { CONFIG_BRIDGE_UART_BAUD, CONFIG_BRIDGE_SOC_UART_BAUD };
+static const char *const BAUD_KEYS[2] = { KEY_BAUD, KEY_SOC_BAUD };
 
 void settings_load(void)
 {
@@ -33,14 +39,17 @@ void settings_load(void)
         }
     }
 
-    int32_t baud = 0;
-    if (nvs_get_i32(h, KEY_BAUD, &baud) == ESP_OK && baud >= 1200 && baud <= 5000000) {
-        s_baud = (int)baud;
+    for (int ch = 0; ch < 2; ch++) {
+        int32_t baud = 0;
+        if (nvs_get_i32(h, BAUD_KEYS[ch], &baud) == ESP_OK && baud >= 1200 && baud <= 5000000) {
+            s_baud[ch] = (int)baud;
+        }
     }
     nvs_close(h);
 
-    ESP_LOGI(TAG, "wifi=%s uart_baud=%d",
-             s_wifi_saved ? (s_ssid[0] ? "saved" : "forgotten") : "menuconfig", s_baud);
+    ESP_LOGI(TAG, "wifi=%s mcu_baud=%d soc_baud=%d",
+             s_wifi_saved ? (s_ssid[0] ? "saved" : "forgotten") : "menuconfig",
+             s_baud[0], s_baud[1]);
 }
 
 bool settings_wifi(char ssid[33], char pass[65])
@@ -99,25 +108,26 @@ esp_err_t settings_forget_wifi(void)
     return write_wifi("", "");
 }
 
-int settings_uart_baud(void)
+int settings_uart_baud(int ch)
 {
-    return s_baud;
+    return (ch == 1) ? s_baud[1] : s_baud[0];
 }
 
-esp_err_t settings_set_uart_baud(int baud)
+esp_err_t settings_set_uart_baud(int ch, int baud)
 {
+    ch = (ch == 1) ? 1 : 0;
     nvs_handle_t h;
     esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
     if (err != ESP_OK) {
         return err;
     }
-    err = nvs_set_i32(h, KEY_BAUD, baud);
+    err = nvs_set_i32(h, BAUD_KEYS[ch], baud);
     if (err == ESP_OK) {
         err = nvs_commit(h);
     }
     nvs_close(h);
     if (err == ESP_OK) {
-        s_baud = baud;
+        s_baud[ch] = baud;
     }
     return err;
 }

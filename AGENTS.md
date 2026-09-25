@@ -5,7 +5,8 @@ To talk to the robot, use the bridge command language in [`docs/COMMANDS.md`](do
 - MCP: server `dreame-bridge` (`python tools/bridge_tool.py mcp`, declared in `.mcp.json`).
 - CLI: `python tools/bridge_tool.py <command>` → one JSON object, exit 0 when `"ok": true`.
 
-Start with `status`, then `uart.xfer <wait_ms> "<cmd>\r\n"` for request/response.
+Start with `status`, then `uart.xfer <wait_ms> "<cmd>\r\n"` (robot MCU) or
+`soc.xfer <wait_ms> "<cmd>\n"` (robot SoC Linux shell) for request/response.
 Do not send `swd HALT`/`STEP`/`RUNUNTIL` or `wifi.*` changes unless the user asked.
 
 Firmware source: `firmware/esp_uart_bridge/` (ESP-IDF 6.x, targets esp32s2 and esp32s3).
