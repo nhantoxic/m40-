@@ -34,6 +34,20 @@ static bool reserve(jbuf_t *jb, size_t extra)
     return true;
 }
 
+void jb_reserve(jbuf_t *jb, size_t extra)
+{
+    if (jb->failed || jb->len + extra + 1 <= jb->cap) {
+        return;
+    }
+    char *p = realloc(jb->buf, jb->len + extra + 1);
+    if (p == NULL) {
+        jb->failed = true;
+        return;
+    }
+    jb->buf = p;
+    jb->cap = jb->len + extra + 1;
+}
+
 static void put(jbuf_t *jb, const char *s, size_t n)
 {
     if (reserve(jb, n)) {

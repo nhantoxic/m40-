@@ -25,10 +25,14 @@
 
 static const char *TAG = "cmd";
 
+/* UART bytes kept per channel for read/xfer. The MCU buffer must hold a
+ * full "info -a" reply (~7.5 KB for 151 variables). */
 #if CONFIG_IDF_TARGET_ESP32S3
-#define CAP_SIZE        16384     /* UART bytes kept for uart.read / uart.xfer */
+#define CAP_MCU         16384
+#define CAP_SOC         16384
 #else
-#define CAP_SIZE        4096
+#define CAP_MCU         12288
+#define CAP_SOC         4096
 #endif
 #define CAP_BIT         BIT0
 #define MAX_WAIT_MS     30000
@@ -40,7 +44,8 @@ static const char *TAG = "cmd";
 
 /* One capture buffer per UART channel (MCU, SoC shell). */
 typedef struct {
-    uint8_t buf[CAP_SIZE];
+    uint8_t *buf;
+    size_t size;
     size_t head;
     size_t len;
     bool overflow;
@@ -49,7 +54,12 @@ typedef struct {
     EventGroupHandle_t ev;
 } capture_t;
 
-static capture_t s_cap[BRIDGE_CH_COUNT];
+static uint8_t s_cap_mcu[CAP_MCU];
+static uint8_t s_cap_soc[CAP_SOC];
+static capture_t s_cap[BRIDGE_CH_COUNT] = {
+    [BRIDGE_CH_MCU] = { .buf = s_cap_mcu, .size = CAP_MCU },
+    [BRIDGE_CH_SOC] = { .buf = s_cap_soc, .size = CAP_SOC },
+};
 
 /* Command prefix per channel: uart.* talks to the MCU, soc.* to the SoC shell. */
 static const char *const CH_PREFIX[BRIDGE_CH_COUNT] = { "uart", "soc" };
@@ -62,11 +72,11 @@ static void cap_tap(int ch, const uint8_t *data, size_t len)
     capture_t *c = &s_cap[ch];
     xSemaphoreTake(c->lock, portMAX_DELAY);
     for (size_t i = 0; i < len; i++) {
-        c->buf[(c->head + c->len) % CAP_SIZE] = data[i];
-        if (c->len < CAP_SIZE) {
+        c->buf[(c->head + c->len) % c->size] = data[i];
+        if (c->len < c->size) {
             c->len++;
         } else {
-            c->head = (c->head + 1) % CAP_SIZE;
+            c->head = (c->head + 1) % c->size;
             c->overflow = true;
         }
     }
@@ -96,7 +106,7 @@ static size_t cap_take(capture_t *c, uint8_t *out, bool *overflow)
     xSemaphoreTake(c->lock, portMAX_DELAY);
     size_t n = c->len;
     for (size_t i = 0; i < n; i++) {
-        out[i] = c->buf[(c->head + i) % CAP_SIZE];
+        out[i] = c->buf[(c->head + i) % c->size];
     }
     c->head = 0;
     c->len = 0;
@@ -271,11 +281,22 @@ static bool fail(jbuf_t *jb, const char *error)
     return false;
 }
 
+/* "hex" is added only when the data is not plain text, so a large text reply
+ * (e.g. info -a) costs ~1x its size in JSON instead of ~3x. */
 static void put_data(jbuf_t *jb, const uint8_t *data, size_t len)
 {
+    bool binary = false;
+    for (size_t i = 0; i < len && !binary; i++) {
+        const uint8_t c = data[i];
+        binary = !(c == '\r' || c == '\n' || c == '\t' || (c >= 0x20 && c < 0x7F));
+    }
+    jb_reserve(jb, len + len / 8 + (binary ? 2 * len : 0) + 128);
     jb_int(jb, "len", (long long)len);
     jb_bytes(jb, "text", data, len);
-    jb_hex(jb, "hex", data, len);
+    if (binary) {
+        jb_bool(jb, "binary", true);
+        jb_hex(jb, "hex", data, len);
+    }
 }
 
 typedef bool (*cmd_fn_t)(jbuf_t *jb, const char *args);
@@ -462,7 +483,7 @@ static bool c_uart_sendhex(jbuf_t *jb, const char *args, int ch)
 
 static bool reply_captured(jbuf_t *jb, capture_t *c)
 {
-    uint8_t *buf = malloc(CAP_SIZE);
+    uint8_t *buf = malloc(c->size);
     if (buf == NULL) {
         return fail(jb, "out of memory");
     }
@@ -640,7 +661,7 @@ static const cmd_t COMMANDS[] = {
       NULL, c_uart_send, CH },                                                                  \
     { P ".sendhex", "<hex>", "send raw bytes to the " WHAT ", e.g. 3C 00 01 3E", NULL, c_uart_sendhex, CH }, \
     { P ".read", "[wait_ms]",                                                                    \
-      "bytes received from the " WHAT " since the last read/xfer (buffer: 4 KB on S2, 16 KB on S3); wait up to wait_ms", \
+      "bytes received from the " WHAT " since the last read/xfer (buffer: S2 12 KB MCU / 4 KB SoC, S3 16 KB); wait up to wait_ms", \
       NULL, c_uart_read, CH },                                                                  \
     { P ".xfer", "<wait_ms> <data>",                                                             \
       "send to the " WHAT " and return the reply (ends after 100 ms of silence or wait_ms)",     \

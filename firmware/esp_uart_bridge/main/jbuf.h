@@ -17,6 +17,8 @@ typedef struct {
 } jbuf_t;
 
 void jb_init(jbuf_t *jb, size_t initial_cap);
+/* Grows the buffer once so `extra` more bytes fit without repeated doubling. */
+void jb_reserve(jbuf_t *jb, size_t extra);
 void jb_obj_open(jbuf_t *jb, const char *key);
 void jb_obj_close(jbuf_t *jb);
 void jb_arr_open(jbuf_t *jb, const char *key);

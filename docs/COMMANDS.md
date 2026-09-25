@@ -26,8 +26,8 @@ with 0 when `ok` is true and 1 otherwise.
 | `uart.baud [rate]` | `baud` | shows or sets and saves the robot UART baud (default 115200) |
 | `uart.send <data>` | `sent` | no line ending is added |
 | `uart.sendhex <hex>` | `sent` | `3C 00 0x01,3E` style, max 1024 bytes |
-| `uart.read [wait_ms]` | `len, text, hex, overflow` | bytes received since the last `uart.read`/`uart.xfer`; waits up to `wait_ms` (≤ 30000) for data, returns after 60 ms of silence |
-| `uart.xfer <wait_ms> <data>` | `sent, len, text, hex, overflow` | clears the buffer, sends, collects the reply; returns after 100 ms of silence or `wait_ms` |
+| `uart.read [wait_ms]` | `len, text, overflow` (+ `binary, hex`) | bytes received since the last `uart.read`/`uart.xfer`; waits up to `wait_ms` (≤ 30000) for data, returns after 60 ms of silence |
+| `uart.xfer <wait_ms> <data>` | `sent, len, text, overflow` (+ `binary, hex`) | clears the buffer, sends, collects the reply; returns after 100 ms of silence or `wait_ms` |
 | `soc.baud` / `soc.send` / `soc.sendhex` / `soc.read` / `soc.xfer` | same as `uart.*` | the same commands for the **robot SoC Linux shell** UART (tcp/2323); `uart.*` is the **robot MCU** |
 | `swd <cmd>` | `response`, `data` (hex, for `READ`) | `PING ID DPID PID CTRL RAW HALT RESUME STEP REGREAD n REGWRITE n v RUNUNTIL … READ addr len`. `WRITE`/`MWRITE`/`DUMP` need the raw port tcp/2325 |
 | `crash` | `boot_mode, reset_reason, early_crashes, crash` | why the last run ended; `crash` = stored panic summary `task=… pc=… bt=…` (decode with the firmware ELF). `boot_mode` is `normal`, `safe` (after 2 early crashes: no UART/SWD/mDNS) or `usb_only` (after 4) |
@@ -49,13 +49,20 @@ uart.send "\x3C\x00\x01\x3E"
 ### Received data
 
 `text` is the reply as a JSON string: valid UTF-8 is kept, and control characters or
-stray bytes appear as `\u00XX` (the byte value). `hex` is the exact bytes. The buffer
-keeps the newest 4 KB (ESP32-S2) / 16 KB (ESP32-S3); `overflow: true` means older
+stray bytes appear as `\u00XX` (the byte value). Only when the data contains such bytes
+does the reply also carry `"binary": true` and `hex` (the exact bytes), so large text
+replies such as `info -a` stay small. The buffer keeps the newest 12 KB (MCU) / 4 KB
+(SoC) on the ESP32-S2 and 16 KB each on the ESP32-S3; `overflow: true` means older
 bytes were dropped. The buffer is shared: two clients calling `uart.read` split the
 data between them.
 
 ## Tips for AI agents
 
+- **Robot MCU CLI (Dreame M40 firmware R2402):** after the robot boots the console is not
+  in command mode. Send the RobotMonitor V4 handshake first: `uart.send "\\"` then
+  `uart.send "<QUIT>"` (see the bridge operator's notes for exact framing), after which
+  every command ends with `\r\n`, e.g. `uart.xfer 1500 "info -a\r\n"` (151 variables,
+  ~7.5 KB), `uart.xfer 800 "ver -t\r\n"` → `R2402`. `info -c` is not supported.
 - Start with `status`. `uart.baud` tells you the rate; `frame_err`/`parity_err`
   going up usually means the baud rate is wrong.
 - Two UARTs: `uart.*` = robot MCU CLI (usually `\r\n`), `soc.*` = robot SoC Linux
