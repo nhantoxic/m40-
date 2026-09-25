@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -9,7 +11,9 @@ extern "C" {
  * A command is one text line; the reply is one line of JSON that always has
  * "ok" and, on failure, "error". Run "help" for the list. */
 
-void cmd_start(void);
+/* usb_reader: also read "@CMD" lines from the USB console (when the SWD
+ * task, which normally owns the console, is not running). */
+void cmd_start(bool usb_reader);
 
 /* Executes one command line. Returns a malloc'd JSON string (caller frees). */
 char *cmd_exec(const char *line);

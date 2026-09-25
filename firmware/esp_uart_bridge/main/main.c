@@ -32,6 +32,7 @@
 #endif
 
 #include "cmd.h"
+#include "crashlog.h"
 #include "discovery.h"
 #include "settings.h"
 #include "swd_bridge.h"
@@ -160,28 +161,54 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    /* First: find out whether the last run crashed, and how badly we are
+     * crash-looping, before starting anything that might crash again. */
+    const boot_mode_t mode = crashlog_init();
+
     settings_load();
     console_input_init();
+
+    if (mode == BOOT_USB_ONLY) {
+        /* No radio, no robot I/O: only the USB console ("@CMD crash", "@CMD reboot"). */
+        cmd_start(true);
+        return;
+    }
 
     /* Wi-Fi does not block: the services listen on every interface, so they
      * work through the setup AP as well as the home network. */
     ESP_ERROR_CHECK(wifi_mgr_start());
+    if (mode == BOOT_SAFE) {
+        wifi_mgr_low_power();   /* in case the resets were brownouts */
+    }
 
 #if CONFIG_BRIDGE_LED_GPIO >= 0
     xTaskCreate(led_task, "led", 2048, NULL, 2, NULL);
 #endif
+
+    if (mode == BOOT_NORMAL) {
 #if CONFIG_BRIDGE_MDNS_ENABLE
-    mdns_start();
+        mdns_start();
 #endif
-    uart_tcp_bridge_start();
-    cmd_start();
+        uart_tcp_bridge_start();
+    }
+    /* The SWD task also reads the USB console; without it cmd reads it itself. */
+    cmd_start(mode != BOOT_NORMAL || !CONFIG_BRIDGE_SWD_ENABLE);
 #if CONFIG_BRIDGE_SWD_ENABLE
-    swd_bridge_start();
+    if (mode == BOOT_NORMAL) {
+        swd_bridge_start();
+    }
 #endif
 #if CONFIG_BRIDGE_DISCOVERY_ENABLE
     discovery_start();
 #endif
     web_start();
+
+    if (mode == BOOT_SAFE) {
+        ESP_LOGE(TAG, "SAFE MODE after %d early crashes (%s): UART, SWD and mDNS are off. "
+                 "Crash: %s", crashlog_crash_count(), crashlog_reset_reason(),
+                 crashlog_summary());
+        return;
+    }
 
     ESP_LOGI(TAG, "ready: app http://%s.local/, raw UART tcp/%d, SWD tcp/%d",
              CONFIG_BRIDGE_HOSTNAME, CONFIG_BRIDGE_TCP_PORT, CONFIG_BRIDGE_SWD_TCP_PORT);

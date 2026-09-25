@@ -1,0 +1,7 @@
+# Name,    Type, SubType,  Offset,   Size
+# nvs/phy_init keep the offsets of the default table, so saved settings survive.
+nvs,       data, nvs,      0x9000,   0x6000
+phy_init,  data, phy,      0xf000,   0x1000
+factory,   app,  factory,  0x10000,  0x1E0000
+# Written by the panic handler; read back at boot (crash report in status/discovery).
+coredump,  data, coredump, 0x1F0000, 0x10000

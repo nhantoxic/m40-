@@ -201,6 +201,8 @@ static void uart_init_channel(channel_t *ch)
     ESP_ERROR_CHECK(uart_param_config(ch->uart, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(ch->uart, ch->tx_gpio, ch->rx_gpio,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    /* An unconnected RX pin would float and feed noise/break events. */
+    gpio_pullup_en(ch->rx_gpio);
     ESP_ERROR_CHECK(uart_set_rx_timeout(ch->uart, RX_TIMEOUT_SYMBOLS));
 
     if (ch->sw_flowctrl) {
@@ -686,8 +688,13 @@ static void tcp_task(void *arg)
     }
 }
 
+static bool s_started;   /* false in safe mode: no UART is touched */
+
 static channel_t *channel(int index)
 {
+    if (!s_started) {
+        return NULL;
+    }
     switch (index) {
     case BRIDGE_CH_MCU:
         return &s_channel_primary;
@@ -793,6 +800,7 @@ static void start_channel(channel_t *ch, const char *rx_name, const char *tcp_na
 
 void uart_tcp_bridge_start(void)
 {
+    s_started = true;
     s_channel_primary.baud = settings_uart_baud(BRIDGE_CH_MCU);
     uart_init_channel(&s_channel_primary);
 #if CONFIG_BRIDGE_UART_AUTOBAUD

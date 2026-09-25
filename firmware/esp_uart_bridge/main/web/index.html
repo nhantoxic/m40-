@@ -149,7 +149,9 @@ async function status(){
     ["Bộ đếm MCU",`nhận ${fmtB(u.rx_bytes)} · gửi ${fmtB(u.tx_bytes)} · lỗi frame ${u.frame_err} · parity ${u.parity_err} · tràn ${u.fifo_ovf+u.buf_full}`],
     ...(sc?[["UART SoC",`${sc.baud} ${sc.mode} · TCP ${sc.tcp_port}${sc.tcp_client?" (đang có client)":""}`],
     ["Bộ đếm SoC",`nhận ${fmtB(sc.rx_bytes)} · gửi ${fmtB(sc.tx_bytes)} · lỗi frame ${sc.frame_err} · parity ${sc.parity_err} · tràn ${sc.fifo_ovf+sc.buf_full}`]]:[]),
-    ["Firmware",`${esc(s.fw)} · uptime ${Math.floor(s.uptime_s/60)} phút · heap ${fmtB(s.free_heap)}`]]);
+    ["Firmware",`${esc(s.fw)} · uptime ${Math.floor(s.uptime_s/60)} phút · heap ${fmtB(s.free_heap)}`],
+    ["Khởi động",s.boot?`${s.boot.boot_mode=="normal"?"bình thường":`<b class="badc">SAFE MODE (${esc(s.boot.boot_mode)})</b>`} · reset lần trước: ${esc(s.boot.reset_reason)}${s.boot.early_crashes?` · crash liên tiếp: ${s.boot.early_crashes}`:""}`:"–"],
+    ...(s.boot&&s.boot.crash?[["Crash lưu",`<code>${esc(s.boot.crash)}</code> <button onclick="cmd('crash.clear').then(status)">Xoá</button>`]]:[])]);
   if(first){first=false;if(!sc){$("chan").querySelector("[value=soc]").remove();if(chan=="soc")switchChan("mcu")}setBaud((chan=="soc"&&sc?sc:u).baud);if(!w.connected)tab("wifi")}
 }
 setInterval(()=>{if(!document.hidden)status()},3000);

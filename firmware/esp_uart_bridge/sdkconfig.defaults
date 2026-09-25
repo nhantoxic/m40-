@@ -27,14 +27,23 @@ CONFIG_UART_ISR_IN_IRAM=y
 
 # Web app + command API: WebSocket terminal, room for the extra sockets
 # (UART/SWD/bitbang listeners + clients, httpd, discovery, mDNS), browser
-# request headers, and a 1.5 MB app partition (NVS offset is unchanged, so
-# saved settings survive the partition table change).
+# request headers.
 CONFIG_HTTPD_WS_SUPPORT=y
 CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT=y
 CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_LWIP_MAX_SOCKETS=22
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# Partitions: 1.875 MB app + 64 KB core dump (partitions.csv; NVS offset is
+# unchanged so saved settings survive). A panic writes the crash to flash; the
+# next boot reports it ("crash" command, status, discovery).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+# The dump runs on its own stack, so it still works when the crashing task
+# overflowed its stack (the FreeRTOS canary check reports that case).
+CONFIG_ESP_COREDUMP_STACK_SIZE=2048
 
 CONFIG_BRIDGE_UART_BAUD=115200
 CONFIG_BRIDGE_TCP_PORT=2324

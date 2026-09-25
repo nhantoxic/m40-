@@ -21,6 +21,10 @@ extern "C" {
 
 esp_err_t wifi_mgr_start(void);   /* non-blocking */
 
+/* Caps Wi-Fi TX power (~11 dBm). Used in safe mode in case the crash loop
+ * came from brownouts during Wi-Fi transmit bursts. */
+void wifi_mgr_low_power(void);
+
 bool wifi_mgr_sta_up(void);
 const char *wifi_mgr_ip(void);    /* station IP, "0.0.0.0" when down */
 bool wifi_mgr_ap_active(void);

@@ -127,6 +127,8 @@ static void ap_on(bool forced)
         err = esp_wifi_set_config(WIFI_IF_AP, &cfg);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "setup AP config: %s", esp_err_to_name(err));
+            esp_wifi_set_mode(WIFI_MODE_STA);
+            return;
         }
         s_ap_on = true;
         s_ap_clients = 0;
@@ -324,8 +326,14 @@ esp_err_t wifi_mgr_start(void)
         ap_on(false);
     }
 
-    xTaskCreate(manager_task, "wifi_mgr", 3072, NULL, 3, NULL);
+    xTaskCreate(manager_task, "wifi_mgr", 4096, NULL, 3, NULL);
     return ESP_OK;
+}
+
+void wifi_mgr_low_power(void)
+{
+    esp_err_t err = esp_wifi_set_max_tx_power(44);   /* 0.25 dBm units */
+    ESP_LOGW(TAG, "TX power capped at 11 dBm: %s", esp_err_to_name(err));
 }
 
 bool wifi_mgr_sta_up(void)

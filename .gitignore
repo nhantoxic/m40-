@@ -18,3 +18,6 @@ sdkconfig.*
 *.elf
 *.log
 __pycache__/
+
+# Prebuilt images are committed on purpose (flash without building).
+!firmware/prebuilt/**

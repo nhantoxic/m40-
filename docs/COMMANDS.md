@@ -30,6 +30,9 @@ with 0 when `ok` is true and 1 otherwise.
 | `uart.xfer <wait_ms> <data>` | `sent, len, text, hex, overflow` | clears the buffer, sends, collects the reply; returns after 100 ms of silence or `wait_ms` |
 | `soc.baud` / `soc.send` / `soc.sendhex` / `soc.read` / `soc.xfer` | same as `uart.*` | the same commands for the **robot SoC Linux shell** UART (tcp/2323); `uart.*` is the **robot MCU** |
 | `swd <cmd>` | `response`, `data` (hex, for `READ`) | `PING ID DPID PID CTRL RAW HALT RESUME STEP REGREAD n REGWRITE n v RUNUNTIL … READ addr len`. `WRITE`/`MWRITE`/`DUMP` need the raw port tcp/2325 |
+| `crash` | `boot_mode, reset_reason, early_crashes, crash` | why the last run ended; `crash` = stored panic summary `task=… pc=… bt=…` (decode with the firmware ELF). `boot_mode` is `normal`, `safe` (after 2 early crashes: no UART/SWD/mDNS) or `usb_only` (after 4) |
+| `crash.clear` | | erase the stored crash and the crash-loop counter |
+| `crash.test` | | deliberately crash, to test the crash report / safe mode |
 | `reboot` | | restarts after the reply |
 
 ### Data escapes (`uart.send`, `uart.xfer`)

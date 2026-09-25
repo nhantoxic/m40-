@@ -12,6 +12,7 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
+#include "crashlog.h"
 #include "discovery.h"
 #include "uart_tcp_bridge.h"
 #include "wifi_mgr.h"
@@ -79,7 +80,7 @@ static void discovery_task(void *arg)
         uart_tcp_bridge_stats_t stats = { 0 };
         uart_tcp_bridge_get_stats(report_channel, &stats);
 
-        char response[512];
+        char response[768];
         int length = snprintf(
             response, sizeof(response),
             "{\"protocol\":\"dreame-bridge-discovery/1\","
@@ -89,6 +90,7 @@ static void discovery_task(void *arg)
             "\"uart_baud\":%d,\"tx_gpio\":%d,\"rx_gpio\":%d,"
             "\"uart_tx_level\":%d,\"uart_rx_level\":%d,"
             "\"swd_port\":%d,\"bitbang_port\":%d,\"http_port\":80,\"setup_ap\":%s,"
+            "\"boot_mode\":\"%s\",\"reset_reason\":\"%s\",\"early_crashes\":%d,\"crash\":\"%s\","
             "\"uart_stats\":{\"rx_bytes\":%u,\"tx_bytes\":%u,"
             "\"frame_err\":%u,\"parity_err\":%u,\"break\":%u,"
             "\"fifo_ovf\":%u,\"buf_full\":%u}}\n",
@@ -103,6 +105,8 @@ static void discovery_task(void *arg)
             CONFIG_BRIDGE_SWD_TCP_PORT,
             CONFIG_BRIDGE_SWD_REMOTE_BITBANG_TCP_PORT,
             wifi_mgr_ap_active() ? "true" : "false",
+            crashlog_mode_name(), crashlog_reset_reason(), crashlog_crash_count(),
+            crashlog_summary(),
             (unsigned)stats.rx_bytes, (unsigned)stats.tx_bytes,
             (unsigned)stats.frame_err, (unsigned)stats.parity_err,
             (unsigned)stats.break_evt, (unsigned)stats.fifo_ovf,
@@ -115,7 +119,7 @@ static void discovery_task(void *arg)
 
 void discovery_start(void)
 {
-    BaseType_t result = xTaskCreate(discovery_task, "discovery", 3072, NULL, 3, NULL);
+    BaseType_t result = xTaskCreate(discovery_task, "discovery", 4096, NULL, 3, NULL);
     if (result != pdPASS) {
         ESP_LOGE(TAG, "cannot create discovery task");
     }

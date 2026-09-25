@@ -33,6 +33,22 @@ Cả hai UART mặc định **115200 8N1**. Đổi lúc chạy bằng `uart.baud
 `soc.baud <rate>` (SoC); giá trị mới được lưu lại. Tắt cổng SoC bằng menuconfig
 `BRIDGE_SOC_UART_ENABLE`.
 
+## Nạp sẵn (không cần build)
+
+`firmware/prebuilt/lolin_s2_mini/` có sẵn bootloader, bảng phân vùng, app và ELF (dùng để giải mã
+crash), kèm hướng dẫn trong [`FLASH.md`](../prebuilt/lolin_s2_mini/FLASH.md). Nên dùng cách này
+khi máy build thiếu RAM hoặc ổ đĩa.
+
+## Crash và safe mode
+
+Firmware lưu mọi panic vào phân vùng `coredump`, và đếm các lần crash sớm (trong 60 s đầu) liên tiếp:
+
+- Sau 2 lần → **safe mode**: chỉ Wi-Fi, discovery, web và lệnh.
+- Sau 4 lần → **usb_only**: chỉ còn USB console.
+
+Lý do reset và crash (task, PC, backtrace) hiện trong `status`, `crash`, discovery và tab Wi-Fi của
+app. Chi tiết xem `FLASH.md` ở trên.
+
 ## Build và nạp
 
 ```powershell
@@ -48,7 +64,10 @@ idf.py set-target esp32s2      # hoặc esp32s3
 idf.py build flash monitor
 ```
 
-Lần build đầu sẽ tải component `espressif/mdns` (cần Internet). ESP-IDF đọc
+Lần build đầu sẽ tải component `espressif/mdns` (cần Internet). Bảng phân vùng là
+`partitions.csv` (app 1,875 MB + coredump 64 KB), khai báo cả trong `sdkconfig.defaults` lẫn
+`platformio.ini`, vì nếu không PlatformIO sẽ tự thay bằng bảng của nó. Web app được biên dịch từ
+`main/web_index.h`; sửa `main/web/index.html` xong thì chạy `python gen_web_index.py`. ESP-IDF đọc
 `sdkconfig.defaults` rồi `sdkconfig.defaults.<chip>`. **Các file này chỉ có tác dụng khi
 `sdkconfig.<env>` được tạo mới.** Nếu bạn đang có sẵn `sdkconfig.lolin_s2_mini` từ firmware cũ,
 hãy xoá nó (Wi-Fi giờ được cài qua app nên file này không còn cần giữ mật khẩu) hoặc sửa bằng
@@ -140,7 +159,8 @@ Gửi `DREAME_BRIDGE_DISCOVER` → JSON gồm `name`, `ip`, `mac`, `uart_port`/`
 - **SWD**: lệnh text đọc theo lô (không còn 1 `recv()` mỗi byte), nhiều lệnh/kết nối;
   remote-bitbang gom `recv`/`send` và ghi thẳng thanh ghi GPIO. Trên S3 chạy ở core 1.
 - **Build**: `-O2`, CPU 240 MHz, lwIP trong IRAM, ISR UART trong IRAM (không tràn FIFO khi đang
-  ghi NVS), phân vùng app 1,5 MB (offset NVS giữ nguyên nên cài đặt không mất).
+  ghi NVS), phân vùng app 1,875 MB + coredump (offset NVS giữ nguyên nên cài đặt không mất).
+  RX của các UART được bật pull-up nên chân bỏ trống không sinh nhiễu.
 - **`send()` được lặp tới hết**, không đổi CR/LF, không Telnet: byte vào sao thì ra vậy.
 
 ## Bảo mật

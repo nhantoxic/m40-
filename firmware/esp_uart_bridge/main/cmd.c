@@ -16,6 +16,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 
+#include "crashlog.h"
 #include "jbuf.h"
 #include "settings.h"
 #include "swd_bridge.h"
@@ -319,6 +320,9 @@ static bool c_status(jbuf_t *jb, const char *args)
     jb_int(jb, "uptime_s", esp_timer_get_time() / 1000000);
     jb_int(jb, "free_heap", esp_get_free_heap_size());
     jb_int(jb, "min_free_heap", esp_get_minimum_free_heap_size());
+    jb_obj_open(jb, "boot");
+    crashlog_json(jb);
+    jb_obj_close(jb);
     jb_obj_open(jb, "wifi");
     wifi_mgr_status_json(jb);
     jb_obj_close(jb);
@@ -575,6 +579,37 @@ static bool c_swd(jbuf_t *jb, const char *args)
     return ok;
 }
 
+static bool c_crash(jbuf_t *jb, const char *args)
+{
+    (void)args;
+    jb_bool(jb, "ok", true);
+    crashlog_json(jb);
+    return true;
+}
+
+static bool c_crash_clear(jbuf_t *jb, const char *args)
+{
+    (void)args;
+    crashlog_clear();
+    jb_bool(jb, "ok", true);
+    return true;
+}
+
+static void crash_test_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(300));   /* let the reply leave */
+    abort();
+}
+
+static bool c_crash_test(jbuf_t *jb, const char *args)
+{
+    (void)args;
+    xTaskCreate(crash_test_task, "crash_test", 2048, NULL, 1, NULL);
+    jb_bool(jb, "ok", true);
+    return true;
+}
+
 static void reboot_task(void *arg)
 {
     (void)arg;
@@ -618,6 +653,9 @@ static const cmd_t COMMANDS[] = {
     { "swd", "<command>",
       "SWD text command: PING ID DPID PID CTRL RAW HALT RESUME STEP REGREAD n REGWRITE n v RUNUNTIL ... READ addr len",
       c_swd, NULL, 0 },
+    { "crash", "", "why the last run ended, stored crash (task, PC, backtrace), boot mode", c_crash, NULL, 0 },
+    { "crash.clear", "", "erase the stored crash and the crash-loop counter", c_crash_clear, NULL, 0 },
+    { "crash.test", "", "deliberately crash (abort) to test crash reporting and safe mode", c_crash_test, NULL, 0 },
     { "reboot", "", "restart the bridge", c_reboot, NULL, 0 },
 };
 
@@ -671,7 +709,6 @@ void cmd_usb_line(const char *line)
     }
 }
 
-#if !CONFIG_BRIDGE_SWD_ENABLE
 /* Without the SWD USB RPC task nobody reads the console; do it here. */
 static void usb_task(void *arg)
 {
@@ -690,9 +727,8 @@ static void usb_task(void *arg)
         }
     }
 }
-#endif
 
-void cmd_start(void)
+void cmd_start(bool usb_reader)
 {
     for (int ch = 0; ch < BRIDGE_CH_COUNT; ch++) {
         s_cap[ch].lock = xSemaphoreCreateMutex();
@@ -701,8 +737,8 @@ void cmd_start(void)
         assert(s_cap[ch].lock && s_cap[ch].xfer_lock && s_cap[ch].ev);
     }
     uart_tcp_bridge_add_tap(cap_tap);
-#if !CONFIG_BRIDGE_SWD_ENABLE
-    xTaskCreate(usb_task, "usb_cmd", 4096, NULL, 3, NULL);
-#endif
+    if (usb_reader) {
+        xTaskCreate(usb_task, "usb_cmd", 4096, NULL, 3, NULL);
+    }
     ESP_LOGI(TAG, "command API ready (HTTP POST /api/cmd, USB \"@CMD <line>\")");
 }
