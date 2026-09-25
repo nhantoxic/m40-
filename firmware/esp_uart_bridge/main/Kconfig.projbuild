@@ -97,8 +97,9 @@ config BRIDGE_UART_RX_BUF
     int "UART driver RX ring buffer (bytes)"
     default 8192
     help
-        Data that arrives while no TCP client is connected is discarded on
-        connect, so this only needs to absorb bursts during a live session.
+        The bridge drains this ring continuously (with or without a client),
+        so it only needs to absorb bursts while Wi-Fi is momentarily slower
+        than the UART.
 
 config BRIDGE_UART_SW_FLOWCTRL
     bool "Software flow control (ixoff) toward the robot"
@@ -172,6 +173,26 @@ config BRIDGE_FLUSH_ON_CONNECT
         Prevents a new client from being greeted with minutes-old, truncated
         log fragments. Turn off if you want to catch a boot log without being
         connected first.
+
+config BRIDGE_UART_BACKLOG
+    int "Bytes received before connect that are replayed to a new client"
+    depends on !BRIDGE_FLUSH_ON_CONNECT
+    default 4096
+    range 0 32768
+    help
+        While no client is connected the bridge keeps the newest N bytes of
+        UART data (per channel) and sends them first when a client connects,
+        so a boot log or a reply that raced the connection is not lost.
+        0 disables the backlog (pre-connect data is then only counted).
+
+config BRIDGE_MDNS_ENABLE
+    bool "Advertise the bridge over mDNS (<hostname>.local)"
+    default y
+    help
+        Lets tools reach the bridge as dreame-bridge.local instead of a DHCP
+        address that changes. Also advertises _dreame-bridge._tcp for the
+        primary UART port. Requires the espressif/mdns managed component
+        (fetched automatically on the first build).
 
 config BRIDGE_SWD_ENABLE
     bool "Enable SWD bridge"

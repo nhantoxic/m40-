@@ -16,6 +16,22 @@ IP là DHCP-assigned; các tool SWD/UART tự dò qua UDP `2326` khi không truy
 Biên dịch được cho cả `esp32s2` (LOLIN S2 mini) và `esp32s3` (DevKitC-1, và sau này là
 module trên bo Rev A).
 
+## Áp dụng bản tối ưu (2026-09-25)
+
+PlatformIO đọc cấu hình từ `sdkconfig.lolin_s2_mini` (file này chứa mật khẩu Wi-Fi, không
+commit). `sdkconfig.defaults` chỉ áp dụng khi file đó được tạo mới, nên với file sẵn có hãy
+thêm/sửa các dòng sau (hoặc chọn trong `pio run -t menuconfig`):
+
+```text
+CONFIG_COMPILER_OPTIMIZATION_PERF=y          # thay cho CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y        # thay cho ..._160=y
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
+CONFIG_BRIDGE_MDNS_ENABLE=y
+```
+
+Lần build đầu sẽ tải managed component `espressif/mdns` (khai báo trong
+`main/idf_component.yml`), cần Internet.
+
 ## Xây dựng
 
 ```bash
@@ -167,14 +183,21 @@ giữ UART0 ở GPIO35/33 và dùng TCP2323 cho SoC, TCP2324 cho MCU.
 
 ## Thiết kế
 
-- **Một client tại một thời điểm trên mỗi kênh.** Hai kênh có thể hoạt động đồng thời nhưng
-  không được trộn dữ liệu vào nhau.
-- **Một task, một vòng lặp cho mỗi kênh.** `select()` trên socket với timeout 5 ms, rồi vét
-  UART không chặn.
+- **Một client tại một thời điểm trên mỗi kênh; client mới chiếm quyền client cũ.** Sau khi
+  Wi-Fi rớt, socket cũ ở trạng thái half-open; trước đây nó giữ cổng tới khi keepalive mặc
+  định của lwIP bỏ cuộc (~2 giờ). Keepalive giờ là 5 s + 3 × 2 s.
+- **Hai task, không polling.** `uart_rx` là task duy nhất đọc UART, thức dậy theo event queue
+  của driver (trễ ≈ RX timeout 10 ký tự, ~0,4 ms ở 230400) và đếm lỗi đường truyền cả khi
+  không có client. `uart_tcp` chờ `select()` không timeout và đẩy byte TCP xuống UART.
 - **`send()` được lặp cho tới hết.** `send()` trả về thiếu là chuyện bình thường; mất đuôi
   một dòng giữa phiên shell là loại lỗi sẽ bị đổ cho robot suốt mấy tuần.
 - **Xả bộ đệm UART khi có client mới** (tắt được). Nếu không, thứ đầu tiên người dùng thấy
   là một mẩu log cụt của mười phút trước — trông y hệt một cú crash đang diễn ra.
+  Khi tắt `BRIDGE_FLUSH_ON_CONNECT`, bridge giữ `BRIDGE_UART_BACKLOG` byte mới nhất
+  (mặc định 4096) nhận được lúc chưa có client và gửi chúng trước tiên khi client kết nối.
+- **SWD text `2325` nhận nhiều lệnh trên một kết nối.** Client cũ kiểu "mỗi lệnh một kết nối"
+  vẫn chạy. Kết nối bị đóng khi rỗi 60 s hoặc khi một lệnh nhị phân bị cắt giữa chừng
+  (READ/DUMP/WRITE/MWRITE), vì khi đó luồng byte không còn khớp khung lệnh.
 - **`ixoff` là tuỳ chọn, mặc định tắt.** Nó có thể giảm nguy cơ tràn khi robot phát log quá
   nhanh, nhưng chỉ an toàn nếu robot thực sự dừng phát khi nhận XOFF; nếu không, hai byte
   điều khiển có thể đi vào console như dữ liệu thường.

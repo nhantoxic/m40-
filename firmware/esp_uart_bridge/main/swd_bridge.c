@@ -79,6 +79,8 @@ static volatile bool s_swdio_output;
  * SWCLK are <32 on the S2-mini wiring, so the GPIO0..31 register bank applies. */
 #define SWDIO_MASK (1U << CONFIG_BRIDGE_SWDIO_GPIO)
 #define SWCLK_MASK (1U << CONFIG_BRIDGE_SWCLK_GPIO)
+_Static_assert(CONFIG_BRIDGE_SWDIO_GPIO < 32 && CONFIG_BRIDGE_SWCLK_GPIO < 32,
+               "SWD bit-bang uses the GPIO0..31 register bank");
 
 static inline void swd_delay(void)
 {
@@ -1071,6 +1073,29 @@ static bool send_all(int sock, const void *data, size_t length)
     return true;
 }
 
+/* A text client may now hold its connection for many commands, so an idle or
+ * vanished peer must not lock the port out: drop it after this long without a
+ * byte. Dead peers (Wi-Fi drop) are also caught by keepalive in ~11 s. */
+#define SWD_TEXT_IDLE_TIMEOUT_S 60
+
+static void configure_client_socket(int sock, int rcv_timeout_s)
+{
+    const int one = 1;
+    const int idle = 5;
+    const int intvl = 2;
+    const int cnt = 3;
+
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    if (rcv_timeout_s > 0) {
+        const struct timeval to = { .tv_sec = rcv_timeout_s, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+    }
+}
+
 static int recv_line(int sock, char *line, size_t capacity)
 {
     size_t used = 0;
@@ -1092,12 +1117,15 @@ static int recv_line(int sock, char *line, size_t capacity)
     return -2;
 }
 
-static void handle_client(int sock)
+/* Handles one command. Returns false when the connection must be closed:
+ * the peer is gone, or a binary transfer was cut short so the byte stream no
+ * longer lines up with the command framing. */
+static bool handle_command(int sock)
 {
     char line[SWD_MAX_LINE];
     int line_len = recv_line(sock, line, sizeof(line));
     if (line_len < 0) {
-        return;
+        return false;
     }
 
     if (strcmp(line, "RAW") == 0) {
@@ -1108,12 +1136,12 @@ static void handle_client(int sock)
         int n = snprintf(response, sizeof(response), "OK RAW=0x%02lX\n",
                          (unsigned long)raw);
         (void)send_all(sock, response, (size_t)n);
-        return;
+        return true;
     }
 
     if (strcmp(line, "PING") == 0) {
         (void)send_all(sock, "PONG PROXY2\n", 12);
-        return;
+        return true;
     }
 
     if (strcmp(line, "CTRL") == 0) {
@@ -1164,7 +1192,7 @@ static void handle_client(int sock)
                          (unsigned long)after);
         }
         (void)send_all(sock, response, (size_t)n);
-        return;
+        return true;
     }
     if (strcmp(line, "DPID") == 0) {
         uint32_t dp_id = 0;
@@ -1185,7 +1213,7 @@ static void handle_client(int sock)
                          s_last_ack, gpio_get_level(CONFIG_BRIDGE_SWDIO_GPIO));
         }
         (void)send_all(sock, response, (size_t)n);
-        return;
+        return true;
     }
 
     if (strcmp(line, "ID") == 0) {
@@ -1208,7 +1236,7 @@ static void handle_client(int sock)
                              s_last_ack, gpio_get_level(CONFIG_BRIDGE_SWDIO_GPIO));
             (void)send_all(sock, response, (size_t)n);
         }
-        return;
+        return true;
     }
 
     if (strcmp(line, "PID") == 0) {
@@ -1229,7 +1257,7 @@ static void handle_client(int sock)
                              s_last_ack);
             (void)send_all(sock, response, (size_t)n);
         }
-        return;
+        return true;
     }
 
     if (strncmp(line, "READ ", 5) == 0) {
@@ -1237,19 +1265,19 @@ static void handle_client(int sock)
         unsigned long address = strtoul(line + 5, &end, 0);
         if (end == line + 5 || *end != ' ') {
             (void)send_all(sock, "ERR syntax\n", 11);
-            return;
+            return true;
         }
         unsigned long length = strtoul(end + 1, &end, 0);
         if (*end != '\0' || length == 0 ||
             length > (unsigned long)CONFIG_BRIDGE_SWD_MAX_READ) {
             (void)send_all(sock, "ERR range\n", 10);
-            return;
+            return true;
         }
 
         uint8_t *buffer = (uint8_t *)malloc((size_t)length);
         if (buffer == NULL) {
             (void)send_all(sock, "ERR memory\n", 11);
-            return;
+            return true;
         }
         xSemaphoreTake(s_swd_lock, portMAX_DELAY);
         swd_status_t status = swd_read_memory_locked((uint32_t)address,
@@ -1261,7 +1289,7 @@ static void handle_client(int sock)
                              swd_status_name(status));
             (void)send_all(sock, response, (size_t)n);
             free(buffer);
-            return;
+            return true;
         }
 
         char header[32];
@@ -1272,7 +1300,7 @@ static void handle_client(int sock)
             ESP_LOGW(TAG, "READ client disconnected while sending data");
         }
         free(buffer);
-        return;
+        return ok;
     }
 
     if (strncmp(line, "DUMP ", 5) == 0) {
@@ -1280,7 +1308,7 @@ static void handle_client(int sock)
         unsigned long address = strtoul(line + 5, &end, 0);
         if (end == line + 5 || *end != ' ') {
             (void)send_all(sock, "ERR syntax\n", 11);
-            return;
+            return true;
         }
         unsigned long length = strtoul(end + 1, &end, 0);
         if (*end != '\0' || length == 0 || (length & 3U) != 0 ||
@@ -1289,17 +1317,17 @@ static void handle_client(int sock)
             !swd_range_contains((uint32_t)address, (size_t)length,
                                 SWD_MEM_FLASH_BASE, SWD_MEM_FLASH_END)) {
             (void)send_all(sock, "ERR range\n", 10);
-            return;
+            return true;
         }
         char header[32];
         int hn = snprintf(header, sizeof(header), "OK %lu\n", length);
         if (hn <= 0 || !send_all(sock, header, (size_t)hn)) {
-            return;
+            return false;
         }
         const size_t CH = 4096U;
         uint8_t *chunk = (uint8_t *)malloc(CH);
         if (chunk == NULL) {
-            return;
+            return false;
         }
         xSemaphoreTake(s_swd_lock, portMAX_DELAY);
         unsigned long done = 0;
@@ -1325,9 +1353,9 @@ static void handle_client(int sock)
              * text error here would be mistaken for payload bytes by clients. */
             ESP_LOGW(TAG, "DUMP stopped after %lu/%lu bytes: %s",
                      done, length, swd_status_name(st));
-            shutdown(sock, SHUT_RDWR);
+            return false;
         }
-        return;
+        return done == length;
     }
 
     if (strncmp(line, "MWRITE ", 7) == 0) {
@@ -1339,7 +1367,7 @@ static void handle_client(int sock)
 
         if (end == line + 7 || *end != ' ') {
             (void)send_all(sock, "ERR syntax\n", 11);
-            return;
+            return true;
         }
 
         unsigned long length =
@@ -1352,11 +1380,11 @@ static void handle_client(int sock)
                                 SWD_MEM_SRAM_BASE, SWD_MEM_SRAM_END)) {
 
             (void)send_all(sock, "ERR range\n", 10);
-            return;
+            return true;
         }
 
         if (!send_all(sock, "OK\n", 3)) {
-            return;
+            return false;
         }
 
         uint8_t *payload =
@@ -1364,7 +1392,7 @@ static void handle_client(int sock)
 
         if (payload == NULL) {
             (void)send_all(sock, "ERR memory\n", 11);
-            return;
+            return false;
         }
 
         size_t got = 0;
@@ -1380,7 +1408,7 @@ static void handle_client(int sock)
 
             if (n <= 0) {
                 free(payload);
-                return;
+                return false;
             }
 
             got += (size_t)n;
@@ -1420,7 +1448,7 @@ static void handle_client(int sock)
         }
 
         (void)send_all(sock,response,(size_t)n);
-        return;
+        return true;
     }
 
 
@@ -1456,7 +1484,7 @@ static void handle_client(int sock)
         }
 
         (void)send_all(sock,response,(size_t)n);
-        return;
+        return true;
     }
 
 
@@ -1500,7 +1528,7 @@ static void handle_client(int sock)
         }
 
         (void)send_all(sock, response, (size_t)n);
-        return;
+        return true;
     }
 
 
@@ -1514,7 +1542,7 @@ static void handle_client(int sock)
                    &max_steps, &stop0, &stop1, &stop2) != 4 ||
             max_steps == 0 || max_steps > 2000000UL) {
             (void)send_all(sock, "ERR syntax\n", 11);
-            return;
+            return true;
         }
 
         uint32_t pc = 0;
@@ -1556,7 +1584,7 @@ static void handle_client(int sock)
         }
 
         (void)send_all(sock, response, (size_t)n);
-        return;
+        return true;
     }
 
     if (strcmp(line, "RESUME") == 0) {
@@ -1583,7 +1611,7 @@ static void handle_client(int sock)
             (void)send_all(sock,response,(size_t)n);
         }
 
-        return;
+        return true;
     }
 
 
@@ -1599,7 +1627,7 @@ static void handle_client(int sock)
             regno > 19UL) {
 
             (void)send_all(sock,"ERR syntax\n",11);
-            return;
+            return true;
         }
 
         uint32_t value = 0;
@@ -1639,7 +1667,7 @@ static void handle_client(int sock)
         }
 
         (void)send_all(sock,response,(size_t)n);
-        return;
+        return true;
     }
 
 
@@ -1652,7 +1680,7 @@ static void handle_client(int sock)
 
         if (end == line + 9 || *end != ' ') {
             (void)send_all(sock,"ERR syntax\n",11);
-            return;
+            return true;
         }
 
         unsigned long value =
@@ -1660,7 +1688,7 @@ static void handle_client(int sock)
 
         if (*end != '\0' || regno > 19UL) {
             (void)send_all(sock,"ERR syntax\n",11);
-            return;
+            return true;
         }
 
         xSemaphoreTake(s_swd_lock, portMAX_DELAY);
@@ -1698,7 +1726,7 @@ static void handle_client(int sock)
         }
 
         (void)send_all(sock,response,(size_t)n);
-        return;
+        return true;
     }
 
     if (strncmp(line, "WRITE ", 6) == 0) {
@@ -1706,7 +1734,7 @@ static void handle_client(int sock)
         unsigned long address = strtoul(line + 6, &end, 0);
         if (end == line + 6 || *end != ' ') {
             (void)send_all(sock, "ERR syntax\n", 11);
-            return;
+            return true;
         }
         unsigned long length = strtoul(end + 1, &end, 0);
         if (*end != '\0' || length == 0 || (length & 1U) != 0 ||
@@ -1715,22 +1743,22 @@ static void handle_client(int sock)
             !swd_range_contains((uint32_t)address, (size_t)length,
                                 SWD_MEM_FLASH_BASE, SWD_MEM_NVM_BASE)) {
             (void)send_all(sock, "ERR range\n", 10);
-            return;
+            return true;
         }
         if (!send_all(sock, "OK\n", 3)) {
-            return;
+            return false;
         }
         uint8_t *payload = (uint8_t *)malloc((size_t)length);
         if (payload == NULL) {
             (void)send_all(sock, "ERR memory\n", 11);
-            return;
+            return false;
         }
         size_t got = 0;
         while (got < (size_t)length) {
             int n = recv(sock, payload + got, (size_t)length - got, 0);
             if (n <= 0) {
                 free(payload);
-                return;
+                return false;
             }
             got += (size_t)n;
         }
@@ -1746,10 +1774,11 @@ static void handle_client(int sock)
             rn = snprintf(resp, sizeof(resp), "ERR SWD %s\n", swd_status_name(st));
         }
         (void)send_all(sock, resp, (size_t)rn);
-        return;
+        return true;
     }
 
     (void)send_all(sock, "ERR command\n", 12);
+    return true;
 }
 
 /* OpenOCD remote_bitbang wire protocol.
@@ -1762,70 +1791,96 @@ static void handle_client(int sock)
  *   Z/z  : optional remote sleep (normally disabled in the host config)
  *   Q    : close the session
  */
+/* Commands are processed from a batched recv() and the sampled bits are
+ * batched into one send(). OpenOCD streams many commands before it waits for
+ * a reply, so this removes one lwIP round trip per bit; replies are flushed
+ * before every blocking recv() so the host can never wait on us. */
+#define RBB_IN_BUF  512
+#define RBB_OUT_BUF 256
+
 static void remote_bitbang_handle_client(int sock)
 {
-    char command;
-    while (recv(sock, &command, 1, 0) == 1) {
-        if (command >= 'd' && command <= 'g') {
-            const unsigned value = (unsigned)(command - 'd');
-            const int swclk = (value & 0x2U) != 0;
-            const int swdio = (value & 0x1U) != 0;
-            if (s_swdio_output) {
-                gpio_set_level(CONFIG_BRIDGE_SWDIO_GPIO, swdio);
-            }
-            gpio_set_level(CONFIG_BRIDGE_SWCLK_GPIO, swclk);
-            continue;
+    uint8_t in[RBB_IN_BUF];
+    char out[RBB_OUT_BUF];
+    size_t out_len = 0;
+
+    for (;;) {
+        int got = recv(sock, in, sizeof(in), 0);
+        if (got <= 0) {
+            return;
         }
 
-        switch (command) {
-        case 'O':
-            swdio_drive(1);
-            break;
-        case 'o':
-            swdio_release();
-            break;
-        case 'c': {
-            const char response = gpio_get_level(CONFIG_BRIDGE_SWDIO_GPIO) ?
-                                   '1' : '0';
-            if (!send_all(sock, &response, 1)) {
+        for (int i = 0; i < got; i++) {
+            const char command = (char)in[i];
+
+            if (command >= 'd' && command <= 'g') {
+                const unsigned value = (unsigned)(command - 'd');
+                if (s_swdio_output) {
+                    REG_WRITE((value & 0x1U) ? GPIO_OUT_W1TS_REG : GPIO_OUT_W1TC_REG,
+                              SWDIO_MASK);
+                }
+                REG_WRITE((value & 0x2U) ? GPIO_OUT_W1TS_REG : GPIO_OUT_W1TC_REG,
+                          SWCLK_MASK);
+                continue;
+            }
+
+            switch (command) {
+            case 'O':
+                swdio_drive(1);
+                break;
+            case 'o':
+                swdio_release();
+                break;
+            case 'c':
+            case 'R':
+                out[out_len++] = (REG_READ(GPIO_IN_REG) & SWDIO_MASK) ? '1' : '0';
+                if (out_len == sizeof(out)) {
+                    if (!send_all(sock, out, out_len)) {
+                        return;
+                    }
+                    out_len = 0;
+                }
+                break;
+            case 'r':
+            case 's':
+            case 't':
+            case 'u':
+                /* No NRST/TRST is connected; leave the SWD clock idle and release
+                 * the bidirectional data line. OpenOCD performs the SWD line
+                 * reset itself through subsequent d* commands. */
+                REG_WRITE(GPIO_OUT_W1TC_REG, SWCLK_MASK);
+                swdio_release();
+                break;
+            case 'Z':
+                esp_rom_delay_us(1000);
+                break;
+            case 'z':
+                esp_rom_delay_us(1);
+                break;
+            case 'B':
+            case 'b':
+                /* LED indication is not wired to this protocol endpoint. */
+                break;
+            case 'Q':
+                if (out_len > 0) {
+                    (void)send_all(sock, out, out_len);
+                }
+                return;
+            default:
+                ESP_LOGW(TAG, "remote_bitbang: unsupported command 0x%02X",
+                         (unsigned char)command);
+                if (out_len > 0) {
+                    (void)send_all(sock, out, out_len);
+                }
                 return;
             }
-            break;
         }
-        case 'R': {
-            const char response = gpio_get_level(CONFIG_BRIDGE_SWDIO_GPIO) ?
-                                   '1' : '0';
-            if (!send_all(sock, &response, 1)) {
+
+        if (out_len > 0) {
+            if (!send_all(sock, out, out_len)) {
                 return;
             }
-            break;
-        }
-        case 'r':
-        case 's':
-        case 't':
-        case 'u':
-            /* No NRST/TRST is connected; leave the SWD clock idle and release
-             * the bidirectional data line. OpenOCD performs the SWD line
-             * reset itself through subsequent d* commands. */
-            gpio_set_level(CONFIG_BRIDGE_SWCLK_GPIO, 0);
-            swdio_release();
-            break;
-        case 'Z':
-            esp_rom_delay_us(1000);
-            break;
-        case 'z':
-            esp_rom_delay_us(1);
-            break;
-        case 'B':
-        case 'b':
-            /* LED indication is not wired to this protocol endpoint. */
-            break;
-        case 'Q':
-            return;
-        default:
-            ESP_LOGW(TAG, "remote_bitbang: unsupported command 0x%02X",
-                     (unsigned char)command);
-            return;
+            out_len = 0;
         }
     }
 }
@@ -1864,7 +1919,8 @@ static void remote_bitbang_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        { const int one = 1; setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
+        /* No idle timeout: OpenOCD may sit quietly between commands. */
+        configure_client_socket(sock, 0);
         xSemaphoreTake(s_swd_lock, portMAX_DELAY);
         remote_bitbang_handle_client(sock);
         xSemaphoreGive(s_swd_lock);
@@ -2211,8 +2267,11 @@ static void swd_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        { const int one = 1; setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
-        handle_client(sock);
+        configure_client_socket(sock, SWD_TEXT_IDLE_TIMEOUT_S);
+        /* Several commands per connection. One-command-per-connection clients
+         * keep working: they close, recv_line() sees EOF, we loop back. */
+        while (handle_command(sock)) {
+        }
         shutdown(sock, SHUT_RDWR);
         close(sock);
     }

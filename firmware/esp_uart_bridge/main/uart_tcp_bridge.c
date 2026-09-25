@@ -1,4 +1,4 @@
-﻿/* Raw TCP <-> UART pumps for the robot SoC console and MCU parameter UART.
+/* Raw TCP <-> UART pumps for the robot SoC console and MCU parameter UART.
  *
  * Each channel owns its UART and listening socket. The byte stream is kept
  * deliberately raw: no Telnet negotiation, CR/LF translation, framing, or
@@ -7,8 +7,18 @@
  *
  * The ESP console is native USB CDC, so UART0 is available for the MCU channel.
  * The primary channel uses UART1; in the temporary S2 mini profile it is
- * routed to the MCU UART pins instead of the SoC pins. One TCP client is
- * allowed per channel.
+ * routed to the MCU UART pins instead of the SoC pins.
+ *
+ * Two tasks per channel, both fully blocking (no polling):
+ *   uart_rx task  - sole reader of the UART. Wakes on the driver's event queue,
+ *                   drains the RX ring and forwards it to the current client.
+ *                   Also counts line errors, with or without a client.
+ *   tcp task      - owns the listening socket and the client socket lifetime.
+ *                   Forwards client bytes to the UART.
+ *
+ * One client per channel. A new connection takes over from the old one: after
+ * a Wi-Fi drop the old socket is half-open and would otherwise hold the port
+ * until TCP keepalive gives up.
  */
 
 #include <assert.h>
@@ -16,9 +26,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "driver/uart.h"
@@ -40,12 +52,28 @@ static const char *TAG = "bridge";
 #define PRIMARY_UART_EVEN_PARITY 0
 #endif
 
+/* Pre-connect backlog only exists when buffered data is kept on connect. */
+#if !CONFIG_BRIDGE_FLUSH_ON_CONNECT && defined(CONFIG_BRIDGE_UART_BACKLOG) && CONFIG_BRIDGE_UART_BACKLOG > 0
+#define BACKLOG_SIZE CONFIG_BRIDGE_UART_BACKLOG
+#else
+#define BACKLOG_SIZE 0
+#endif
+
 #define SOC_UART_PORT       UART_NUM_1
 #define MCU_UART_PORT       UART_NUM_0
 #define CHUNK               1024
-#define POLL_MS             5
-#define LISTEN_BACKLOG      1
-#define UART_EVT_QUEUE_LEN  20
+#define LISTEN_BACKLOG      2
+#define UART_EVT_QUEUE_LEN  32
+/* Safety net only: a dropped UART_DATA event must not strand bytes in the ring. */
+#define RX_EVT_TIMEOUT_MS   20
+
+/* A client that vanished without FIN (Wi-Fi drop, laptop sleep) is detected
+ * after IDLE + INTVL * CNT = 11 s instead of lwIP's default two hours. */
+#define KEEPALIVE_IDLE_S    5
+#define KEEPALIVE_INTVL_S   2
+#define KEEPALIVE_CNT       3
+/* A client that stops reading must not stall the UART reader forever. */
+#define SEND_TIMEOUT_S      10
 
 /* ESP-IDF applies software-flow-control thresholds to the hardware RX FIFO,
  * not the driver's much larger RX ring. ESP32-S2/S3 UARTs have a 128-byte
@@ -64,8 +92,11 @@ typedef struct {
     int rx_buf;
     bool sw_flowctrl;
     volatile bool *client_flag;
-    TaskHandle_t task;
     QueueHandle_t evt_queue;
+    /* Guards `client` and the backlog; held by the UART task while sending so
+     * the TCP task never closes a socket that is mid-send. */
+    SemaphoreHandle_t lock;
+    int client;
     volatile uint32_t rx_bytes;
     volatile uint32_t tx_bytes;
     volatile uint32_t frame_err;
@@ -73,7 +104,13 @@ typedef struct {
     volatile uint32_t break_evt;
     volatile uint32_t fifo_ovf;
     volatile uint32_t buf_full;
-    uint8_t buffer[CHUNK];
+    uint8_t rx_chunk[CHUNK];   /* UART -> TCP, owned by the uart_rx task */
+    uint8_t tx_chunk[CHUNK];   /* TCP -> UART, owned by the tcp task */
+#if BACKLOG_SIZE > 0
+    uint8_t backlog[BACKLOG_SIZE];
+    size_t backlog_head;       /* index of the oldest byte */
+    size_t backlog_len;
+#endif
 } channel_t;
 
 static volatile bool s_soc_client;
@@ -101,6 +138,7 @@ static channel_t s_channel_primary = {
     .sw_flowctrl  = false,
 #endif
     .client_flag  = &s_soc_client,
+    .client       = -1,
 };
 
 #if CONFIG_BRIDGE_MCU_UART_ENABLE
@@ -119,6 +157,7 @@ static channel_t s_channel_mcu = {
     .rx_buf       = CONFIG_BRIDGE_MCU_UART_RX_BUF,
     .sw_flowctrl  = false,
     .client_flag  = &s_mcu_client,
+    .client       = -1,
 };
 #endif
 
@@ -142,11 +181,17 @@ static void uart_init_channel(channel_t *ch)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
+    ch->lock = xSemaphoreCreateMutex();
+    assert(ch->lock != NULL);
+
     ESP_ERROR_CHECK(uart_driver_install(ch->uart, ch->rx_buf, ch->rx_buf,
                                         UART_EVT_QUEUE_LEN, &ch->evt_queue, 0));
     ESP_ERROR_CHECK(uart_param_config(ch->uart, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(ch->uart, ch->tx_gpio, ch->rx_gpio,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    /* Default RX timeout is ~10 symbols idle; keep it (0.4 ms at 230400) so a
+     * short reply is delivered as soon as the line goes quiet. */
 
     if (ch->sw_flowctrl) {
         ESP_ERROR_CHECK(uart_set_sw_flow_ctrl(ch->uart, true,
@@ -183,131 +228,148 @@ static bool send_all(int sock, const uint8_t *buf, size_t len)
     return true;
 }
 
-static void serve(channel_t *ch, int sock)
+#if BACKLOG_SIZE > 0
+/* Keeps the newest BACKLOG_SIZE bytes. Called with ch->lock held. */
+static void backlog_push(channel_t *ch, const uint8_t *data, size_t len)
 {
-    const int one = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-
-#if CONFIG_BRIDGE_FLUSH_ON_CONNECT
-    uart_flush_input(ch->uart);
-#endif
-
-    for (;;) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(sock, &rfds);
-
-        struct timeval tv = { .tv_sec = 0, .tv_usec = POLL_MS * 1000 };
-        int ready = select(sock + 1, &rfds, NULL, NULL, &tv);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            ESP_LOGW(TAG, "%s: select failed: %d", ch->name, errno);
-            return;
-        }
-
-        /* TCP -> UART */
-        if (ready > 0 && FD_ISSET(sock, &rfds)) {
-            int n = recv(sock, ch->buffer, CHUNK, 0);
-            if (n == 0) {
-                ESP_LOGI(TAG, "%s: client closed", ch->name);
-                return;
-            }
-            if (n < 0) {
-                if (errno != EINTR) {
-                    ESP_LOGW(TAG, "%s: recv failed: %d", ch->name, errno);
-                    return;
-                }
-            } else if (uart_write_bytes(ch->uart, (const char *)ch->buffer,
-                                        (size_t)n) < 0) {
-                ESP_LOGW(TAG, "%s: uart write failed", ch->name);
-                return;
-            } else {
-                ch->tx_bytes += (uint32_t)n;
-            }
-        }
-
-        /* UART -> TCP. Non-blocking: select() above provides the pacing. */
-        int n = uart_read_bytes(ch->uart, ch->buffer, CHUNK, 0);
-        if (n > 0) {
-            ch->rx_bytes += (uint32_t)n;
-            if (!send_all(sock, ch->buffer, (size_t)n)) {
-                ESP_LOGW(TAG, "%s: send failed: %d", ch->name, errno);
-                return;
-            }
+    if (len >= BACKLOG_SIZE) {
+        data += len - BACKLOG_SIZE;
+        len = BACKLOG_SIZE;
+    }
+    for (size_t i = 0; i < len; i++) {
+        size_t tail = (ch->backlog_head + ch->backlog_len) % BACKLOG_SIZE;
+        ch->backlog[tail] = data[i];
+        if (ch->backlog_len < BACKLOG_SIZE) {
+            ch->backlog_len++;
+        } else {
+            ch->backlog_head = (ch->backlog_head + 1) % BACKLOG_SIZE;
         }
     }
 }
 
-/* Keeps counting while no TCP client is attached, so the discovery endpoint can
- * say whether the peer ever spoke. Draining here is not a behaviour change:
- * CONFIG_BRIDGE_FLUSH_ON_CONNECT already discards pre-connect backlog. Frame and
- * parity errors arrive on the driver event queue and are counted separately. */
-static void monitor_task(void *arg)
+/* Sends and clears the backlog. Called with ch->lock held. */
+static void backlog_replay(channel_t *ch, int sock)
+{
+    size_t first = BACKLOG_SIZE - ch->backlog_head;
+    if (first > ch->backlog_len) {
+        first = ch->backlog_len;
+    }
+    if (ch->backlog_len > 0) {
+        ESP_LOGI(TAG, "%s: replaying %u byte(s) received before connect",
+                 ch->name, (unsigned)ch->backlog_len);
+        if (send_all(sock, ch->backlog + ch->backlog_head, first)) {
+            (void)send_all(sock, ch->backlog, ch->backlog_len - first);
+        }
+    }
+    ch->backlog_head = 0;
+    ch->backlog_len = 0;
+}
+#endif
+
+/* ---------------------------------------------------------------- UART -> TCP */
+
+static void forward_to_client(channel_t *ch, const uint8_t *data, size_t len)
+{
+    xSemaphoreTake(ch->lock, portMAX_DELAY);
+    if (ch->client >= 0) {
+        if (!send_all(ch->client, data, len)) {
+            /* Wake the tcp task out of recv(); it owns close(). */
+            ESP_LOGW(TAG, "%s: send failed (%d), dropping client", ch->name, errno);
+            shutdown(ch->client, SHUT_RDWR);
+            ch->client = -1;
+            *ch->client_flag = false;
+        }
+    }
+#if BACKLOG_SIZE > 0
+    else {
+        backlog_push(ch, data, len);
+    }
+#endif
+    xSemaphoreGive(ch->lock);
+}
+
+static void drain_uart(channel_t *ch)
+{
+    for (;;) {
+        size_t avail = 0;
+        if (uart_get_buffered_data_len(ch->uart, &avail) != ESP_OK || avail == 0) {
+            return;
+        }
+        int n = uart_read_bytes(ch->uart, ch->rx_chunk,
+                                avail < CHUNK ? avail : CHUNK, 0);
+        if (n <= 0) {
+            return;
+        }
+        ch->rx_bytes += (uint32_t)n;
+        forward_to_client(ch, ch->rx_chunk, (size_t)n);
+    }
+}
+
+/* Sole reader of the UART. Keeps counting while no TCP client is attached, so
+ * the discovery endpoint can say whether the peer ever spoke. */
+static void uart_rx_task(void *arg)
 {
     channel_t *ch = (channel_t *)arg;
-    uint8_t scratch[128];
 
     for (;;) {
         uart_event_t evt;
-        while (xQueueReceive(ch->evt_queue, &evt, 0) == pdTRUE) {
+        if (xQueueReceive(ch->evt_queue, &evt, pdMS_TO_TICKS(RX_EVT_TIMEOUT_MS)) == pdTRUE) {
             switch (evt.type) {
             case UART_FRAME_ERR:   ch->frame_err++;  break;
             case UART_PARITY_ERR:  ch->parity_err++; break;
             case UART_BREAK:       ch->break_evt++;  break;
+            /* The driver already reset the FIFO; count it and drain the ring. */
             case UART_FIFO_OVF:    ch->fifo_ovf++;   break;
+            /* RX interrupts stay off until the ring is read; drain_uart does that. */
             case UART_BUFFER_FULL: ch->buf_full++;   break;
             default: break;
             }
         }
-
-        if (!*ch->client_flag) {
-            int n = uart_read_bytes(ch->uart, scratch, sizeof(scratch), 0);
-            if (n > 0) {
-                ch->rx_bytes += (uint32_t)n;
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(50));
+        drain_uart(ch);
     }
 }
 
-void uart_tcp_bridge_get_stats(int index, uart_tcp_bridge_stats_t *out)
+/* ---------------------------------------------------------------- TCP -> UART */
+
+static void configure_client_socket(int sock)
 {
-    const channel_t *ch = NULL;
+    const int one = 1;
+    const int idle = KEEPALIVE_IDLE_S;
+    const int intvl = KEEPALIVE_INTVL_S;
+    const int cnt = KEEPALIVE_CNT;
+    const struct timeval snd_to = { .tv_sec = SEND_TIMEOUT_S, .tv_usec = 0 };
 
-    if (out == NULL) {
-        return;
-    }
-    *out = (uart_tcp_bridge_stats_t){ 0 };
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
+}
 
-    switch (index) {
-    case 0:
-        ch = &s_channel_primary;
-        break;
-#if CONFIG_BRIDGE_MCU_UART_ENABLE
-    case 1:
-        ch = &s_channel_mcu;
-        break;
+static void attach_client(channel_t *ch, int sock)
+{
+    xSemaphoreTake(ch->lock, portMAX_DELAY);
+#if CONFIG_BRIDGE_FLUSH_ON_CONNECT
+    uart_flush_input(ch->uart);
+#elif BACKLOG_SIZE > 0
+    backlog_replay(ch, sock);
 #endif
-    default:
-        return;
-    }
-
-    out->rx_bytes   = ch->rx_bytes;
-    out->tx_bytes   = ch->tx_bytes;
-    out->frame_err  = ch->frame_err;
-    out->parity_err = ch->parity_err;
-    out->break_evt  = ch->break_evt;
-    out->fifo_ovf   = ch->fifo_ovf;
-    out->buf_full   = ch->buf_full;
+    ch->client = sock;
+    *ch->client_flag = true;
+    xSemaphoreGive(ch->lock);
 }
 
-int uart_tcp_bridge_baud(void)
+static void detach_client(channel_t *ch, int sock)
 {
-    return s_channel_primary.baud;
+    xSemaphoreTake(ch->lock, portMAX_DELAY);
+    if (ch->client == sock) {
+        ch->client = -1;
+        *ch->client_flag = false;
+    }
+    xSemaphoreGive(ch->lock);
+    shutdown(sock, SHUT_RDWR);
+    close(sock);
 }
 
 #if CONFIG_BRIDGE_UART_AUTOBAUD
@@ -514,7 +576,7 @@ static void pin_watch_task(void *arg)
 }
 #endif /* temporary pin_watch_task disabled */
 
-static void bridge_task(void *arg)
+static void tcp_task(void *arg)
 {
     channel_t *ch = (channel_t *)arg;
     int listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -535,28 +597,122 @@ static void bridge_task(void *arg)
 
     ESP_LOGI(TAG, "%s: listening on tcp/%d", ch->name, ch->tcp_port);
 
+    int client = -1;
+    char client_ip[16] = "";
+
     for (;;) {
-        struct sockaddr_in peer;
-        socklen_t peer_len = sizeof(peer);
-        int sock = accept(listener, (struct sockaddr *)&peer, &peer_len);
-        if (sock < 0) {
-            ESP_LOGW(TAG, "%s: accept failed: %d", ch->name, errno);
-            vTaskDelay(pdMS_TO_TICKS(200));
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(listener, &rfds);
+        int maxfd = listener;
+        if (client >= 0) {
+            FD_SET(client, &rfds);
+            if (client > maxfd) {
+                maxfd = client;
+            }
+        }
+
+        int ready = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (ready < 0) {
+            if (errno != EINTR) {
+                ESP_LOGW(TAG, "%s: select failed: %d", ch->name, errno);
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
             continue;
         }
 
-        char ip[16];
-        inet_ntoa_r(peer.sin_addr, ip, sizeof(ip));
-        ESP_LOGI(TAG, "%s: client %s connected", ch->name, ip);
+        /* Read the current client before looking at a new connection, so the
+         * bytes it already sent still reach the UART on takeover. */
+        if (client >= 0 && FD_ISSET(client, &rfds)) {
+            int n = recv(client, ch->tx_chunk, CHUNK, 0);
+            if (n > 0) {
+                if (uart_write_bytes(ch->uart, (const char *)ch->tx_chunk,
+                                     (size_t)n) < 0) {
+                    ESP_LOGW(TAG, "%s: uart write failed", ch->name);
+                } else {
+                    ch->tx_bytes += (uint32_t)n;
+                }
+            } else if (n == 0 || (errno != EINTR && errno != EAGAIN)) {
+                if (n == 0) {
+                    ESP_LOGI(TAG, "%s: client %s closed", ch->name, client_ip);
+                } else {
+                    ESP_LOGW(TAG, "%s: client %s recv failed: %d", ch->name,
+                             client_ip, errno);
+                }
+                detach_client(ch, client);
+                client = -1;
+            }
+        }
 
-        *ch->client_flag = true;
-        serve(ch, sock);
-        *ch->client_flag = false;
+        if (FD_ISSET(listener, &rfds)) {
+            struct sockaddr_in peer;
+            socklen_t peer_len = sizeof(peer);
+            int sock = accept(listener, (struct sockaddr *)&peer, &peer_len);
+            if (sock < 0) {
+                ESP_LOGW(TAG, "%s: accept failed: %d", ch->name, errno);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            configure_client_socket(sock);
 
-        shutdown(sock, SHUT_RDWR);
-        close(sock);
-        ESP_LOGI(TAG, "%s: client %s gone", ch->name, ip);
+            char ip[16];
+            inet_ntoa_r(peer.sin_addr, ip, sizeof(ip));
+            if (client >= 0) {
+                ESP_LOGW(TAG, "%s: client %s replaced by %s", ch->name,
+                         client_ip, ip);
+                detach_client(ch, client);
+            } else {
+                ESP_LOGI(TAG, "%s: client %s connected", ch->name, ip);
+            }
+            client = sock;
+            strlcpy(client_ip, ip, sizeof(client_ip));
+            attach_client(ch, client);
+        }
     }
+}
+
+void uart_tcp_bridge_get_stats(int index, uart_tcp_bridge_stats_t *out)
+{
+    const channel_t *ch = NULL;
+
+    if (out == NULL) {
+        return;
+    }
+    *out = (uart_tcp_bridge_stats_t){ 0 };
+
+    switch (index) {
+    case 0:
+        ch = &s_channel_primary;
+        break;
+#if CONFIG_BRIDGE_MCU_UART_ENABLE
+    case 1:
+        ch = &s_channel_mcu;
+        break;
+#endif
+    default:
+        return;
+    }
+
+    out->rx_bytes   = ch->rx_bytes;
+    out->tx_bytes   = ch->tx_bytes;
+    out->frame_err  = ch->frame_err;
+    out->parity_err = ch->parity_err;
+    out->break_evt  = ch->break_evt;
+    out->fifo_ovf   = ch->fifo_ovf;
+    out->buf_full   = ch->buf_full;
+}
+
+int uart_tcp_bridge_baud(void)
+{
+    return s_channel_primary.baud;
+}
+
+static void start_channel(channel_t *ch, const char *rx_name, const char *tcp_name)
+{
+    /* The UART reader runs above the TCP side so a burst from the robot is
+     * moved out of the 128-byte FIFO/ring before anything else. */
+    xTaskCreate(uart_rx_task, rx_name, 3072, ch, 6, NULL);
+    xTaskCreate(tcp_task, tcp_name, 4096, ch, 5, NULL);
 }
 
 void uart_tcp_bridge_start(void)
@@ -565,9 +721,7 @@ void uart_tcp_bridge_start(void)
 #if CONFIG_BRIDGE_UART_AUTOBAUD
     autobaud_probe(&s_channel_primary);
 #endif
-    xTaskCreate(bridge_task, "uart_soc", 4096, &s_channel_primary, 5,
-                &s_channel_primary.task);
-    xTaskCreate(monitor_task, "uart_soc_mon", 3072, &s_channel_primary, 4, NULL);
+    start_channel(&s_channel_primary, "uart_rx", "uart_tcp");
 
 #if CONFIG_BRIDGE_MCU_UART_ENABLE
     if (CONFIG_BRIDGE_UART_TX_GPIO == CONFIG_BRIDGE_MCU_UART_TX_GPIO ||
@@ -583,10 +737,6 @@ void uart_tcp_bridge_start(void)
     }
 
     uart_init_channel(&s_channel_mcu);
-    xTaskCreate(bridge_task, "uart_mcu", 4096, &s_channel_mcu, 5,
-                &s_channel_mcu.task);
-    xTaskCreate(monitor_task, "uart_mcu_mon", 3072, &s_channel_mcu, 4, NULL);
+    start_channel(&s_channel_mcu, "mcu_rx", "mcu_tcp");
 #endif
 }
-
-

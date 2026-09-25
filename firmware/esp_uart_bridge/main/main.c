@@ -18,6 +18,9 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
+#if CONFIG_BRIDGE_MDNS_ENABLE
+#include "mdns.h"
+#endif
 
 #include "uart_tcp_bridge.h"
 #include "swd_bridge.h"
@@ -43,6 +46,26 @@ static const char *TAG = "main";
 #error "MCU UART GPIOs overlap SWD; move the UART pins or disable SWD"
 #endif
 #endif
+#endif
+
+#if CONFIG_BRIDGE_MDNS_ENABLE
+/* <hostname>.local survives DHCP handing out a new address. Not fatal: the
+ * UDP discovery responder still works without it. */
+static void mdns_start(void)
+{
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_init failed: %s", esp_err_to_name(err));
+        return;
+    }
+    mdns_hostname_set(CONFIG_BRIDGE_HOSTNAME);
+    mdns_instance_name_set("Dreame UART/SWD bridge");
+    mdns_service_add(NULL, "_dreame-bridge", "_tcp", CONFIG_BRIDGE_TCP_PORT, NULL, 0);
+#if CONFIG_BRIDGE_SWD_ENABLE
+    mdns_service_add(NULL, "_dreame-swd", "_tcp", CONFIG_BRIDGE_SWD_TCP_PORT, NULL, 0);
+#endif
+    ESP_LOGI(TAG, "mDNS: %s.local", CONFIG_BRIDGE_HOSTNAME);
+}
 #endif
 
 #if CONFIG_BRIDGE_LED_GPIO >= 0
@@ -95,6 +118,9 @@ void app_main(void)
 #endif
 
     ESP_ERROR_CHECK(wifi_sta_start_and_wait());
+#if CONFIG_BRIDGE_MDNS_ENABLE
+    mdns_start();
+#endif
     uart_tcp_bridge_start();
 #if CONFIG_BRIDGE_SWD_ENABLE
     swd_bridge_start();
